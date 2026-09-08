@@ -1,5 +1,6 @@
 import requests
 import os
+#from config import something
 
 
 class AlphaVantage: 
