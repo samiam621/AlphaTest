@@ -1,3 +1,7 @@
 requests
-FastAPI
+fastapi
 uvicorn
+google-generativeai
+sqlalchemy
+psycopg2-binary
+python-dotenv
