@@ -25,10 +25,10 @@ from typing import Any
 
 import pandas as pd
 
+from backend.app.backtest import execution as execution_mod
 from backend.app.backtest import metrics as metrics_mod
 from backend.app.backtest import trades as trades_mod
 from backend.app.backtest.config import BacktestConfig, periods_per_year
-from backend.app.strategies.signal_utils import lag
 
 
 @dataclass(frozen=True)
@@ -36,8 +36,9 @@ class BacktestResult:
     """Everything one run produced. Series stay as pandas for the API to shape."""
 
     equity: pd.Series
-    #: What the same money would have done just holding the asset. Cost-free:
-    #: it is the "why bother" baseline, not a competing strategy.
+    #: What the same money would have done just holding the asset. Cost-free,
+    #: and always close-to-close from the first bar whatever the execution
+    #: model: it is the "why bother" baseline, not a competing strategy.
     benchmark_equity: pd.Series
     #: The curve without trading costs — the gap to ``equity`` is the cost drag.
     gross_equity: pd.Series
@@ -57,12 +58,6 @@ def _validate(df: pd.DataFrame, signal: pd.Series, config: BacktestConfig) -> No
         raise ValueError("price data needs a 'close' column to compute returns")
     if config.execution == "next_open" and "open" not in df.columns:
         raise ValueError("execution='next_open' needs an 'open' column")
-    if config.execution != "close":
-        raise NotImplementedError(
-            f"execution={config.execution!r} is not implemented yet; "
-            f"only 'close' is available"
-        )
-
     if not signal.index.equals(df.index):
         # Reindexing silently would introduce NaN positions and quietly flatten
         # part of the backtest, which is far worse than refusing to run.
@@ -99,19 +94,18 @@ def run(
     _validate(df, signal, config)
 
     close = df["close"].astype(float)
-    # Bar 0 has no prior close. Nothing is held into it either, so a 0 return is
-    # accurate here rather than a fudge.
-    asset_returns = close.pct_change().fillna(0.0)
 
-    position = lag(signal).astype(float)
+    # The execution model decides what each position earns and at what price it
+    # was filled. Everything below is the same arithmetic either way.
+    fills = execution_mod.build(df, signal, config.execution)
+    position, gross_returns = fills.position, fills.gross_returns
 
     # Trading costs land on the bar where the position changed — the same bar
-    # whose return the new position first earns.
+    # the fill happened on.
     turnover = position.diff().abs()
     turnover.iloc[0] = abs(position.iloc[0])
     costs = turnover * config.cost_rate
 
-    gross_returns = position * asset_returns
     net_returns = gross_returns - costs
 
     capital = config.initial_capital
@@ -119,9 +113,7 @@ def run(
     gross_equity = capital * (1 + gross_returns).cumprod()
     benchmark_equity = capital * close / close.iloc[0]
 
-    ledger = trades_mod.extract(
-        close, position, gross_returns, net_returns, config.cost_rate
-    )
+    ledger = trades_mod.extract(fills, net_returns, close, config.cost_rate)
 
     ppy = periods_per_year(interval)
     summary = metrics_mod.summarize(

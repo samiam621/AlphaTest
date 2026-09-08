@@ -6,8 +6,10 @@ the interval -> bars-per-year table that every annualised metric needs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Mapping
 
+from backend.app import params as params_mod
 from backend.app.ingestion.yfinance_source import VALID_INTERVALS
 
 # Trading days in a year, and the length of a regular US equity session. Every
@@ -80,7 +82,7 @@ class BacktestConfig:
     #               price you only knew once the bar was over.
     # "next_open" — fill at the next bar's open. More honest about what was
     #               actually reachable.
-    execution: str = "close"
+    execution: str = field(default="close", metadata={"choices": EXECUTION_MODELS})
 
     # Annualised, as a decimal: 0.04 is 4%. Used as the hurdle in Sharpe and
     # Sortino. Negative is allowed — real policy rates have been.
@@ -116,3 +118,17 @@ class BacktestConfig:
     def cost_rate(self) -> float:
         """Cost of one side of a trade, as a fraction of the traded value."""
         return (self.commission_bps + self.slippage_bps) / 10_000
+
+
+def build_config(values: Mapping[str, Any] | None = None) -> BacktestConfig:
+    """Build a config from partial user input, the way strategy params are built.
+
+    Unknown keys are rejected and values are coerced before ``__post_init__``
+    gets to enforce the ranges.
+    """
+    return params_mod.build(BacktestConfig, values, "config")
+
+
+def describe_config() -> list[dict[str, Any]]:
+    """The config schema, so a UI can render the settings form from one source."""
+    return params_mod.describe(BacktestConfig)
