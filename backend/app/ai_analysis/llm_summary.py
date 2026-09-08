@@ -1,9 +1,10 @@
-from google import generativeai
-from google.generativeai import types
+from google import genai
+from google.genai import types
 from config import GEMINI_API_KEY
 
 
 
 #ai will summarize backetesting performance
+#can add later once everything is done
 
-client=generativeai.Client(api_key=GEMINI_API_KEY)
+client=genai.Client(api_key=GEMINI_API_KEY)
