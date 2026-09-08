@@ -8,6 +8,7 @@ Strategy-specific inputs are handled by the strategy layer
 
 """
 
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
@@ -195,7 +196,15 @@ def _normalize(history: pd.DataFrame) -> pd.DataFrame:
 
 
 def to_records(df: pd.DataFrame) -> list[dict]:
-    """JSON-serialisable rows for the API response."""
+    """JSON-serialisable rows for the API response.
+
+    NaN is replaced with None. JSON has no NaN literal, so json.dumps would emit
+    a bare ``NaN`` token that the browser's JSON.parse rejects — and once
+    indicator columns are joined on, every warm-up period is full of them.
+    """
     out = df.reset_index()
     out["date"] = out["date"].apply(lambda ts: ts.isoformat())
-    return out.to_dict(orient="records")
+    return [
+        {k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in row.items()}
+        for row in out.to_dict(orient="records")
+    ]
