@@ -38,7 +38,6 @@ def generate_signals(
     df: pd.DataFrame,
     params: MacdCrossoverParams | None = None,
 ) -> pd.DataFrame:
-    """Return ``macd``, ``signal_line``, ``hist`` and a 0/1 ``signal`` column."""
     params = params or MacdCrossoverParams()
     require_columns(df, ("close",))
 

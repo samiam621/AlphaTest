@@ -1,7 +1,12 @@
+from dataclasses import asdict
+
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from backend.app.backtest import engine, metrics, trades as trades_mod
+from backend.app.backtest.config import build_config, describe_config
 from backend.app.ingestion.yfinance_source import (
     VALID_INTERVALS,
     VALID_PERIODS,
@@ -9,12 +14,10 @@ from backend.app.ingestion.yfinance_source import (
     to_records,
 )
 from backend.app.strategies import registry
-from backend.app.strategies.signal_utils import lag
 
-app = FastAPI(title="Trading Backtester")
+app = FastAPI(title="AlphaTest")
 
-# No trailing slashes — CORS origins are matched exactly, so "http://localhost:5173/"
-# would never match the browser's "http://localhost:5173" Origin header.
+# No trailing slashes
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -79,7 +82,7 @@ def list_strategies():
 
 
 class BacktestRequest(BaseModel):
-    """A strategy run: the same data selection as /api/data, plus the rule."""
+    """A strategy run: data selection, the rule, and the trading assumptions."""
 
     ticker: str
     start: str | None = None
@@ -93,16 +96,29 @@ class BacktestRequest(BaseModel):
     # Whatever the user changed from the defaults. Anything left out keeps the
     # strategy's own default, so the frontend can send only the edited fields.
     params: dict = Field(default_factory=dict)
+    # Capital and cost assumptions; same partial-override rules as params.
+    config: dict = Field(default_factory=dict)
+
+    # The bar-by-bar frame is the largest part of the response by far and the
+    # metrics view does not need it. Ten years of hourly bars with indicator
+    # columns runs to megabytes.
+    include_bars: bool = True
+
+
+@app.get("/api/backtest/config")
+def backtest_config_schema():
+    """Defaults and types for the trading assumptions, for the settings form."""
+    return {"config": describe_config()}
 
 
 @app.post("/api/backtest")
 def run_backtest(req: BacktestRequest):
-    """Run one strategy over one ticker and return the bars it decided on.
+    """Run one strategy over one ticker and report how it would have done.
 
-    Each bar carries the strategy's indicator values, the ``signal`` it decided
-    on using that bar's close, and the ``position`` that signal can actually be
-    traded at — one bar later, because the close used to make the decision had
-    already happened by the time you saw it.
+    The response has four parts: ``metrics`` (headline performance, including a
+    buy-and-hold benchmark), ``equity`` (the curve, for charting), ``trades``
+    (the round-trip ledger) and optionally ``bars`` (per-bar indicator values
+    and positions).
     """
     try:
         strategy = registry.get(req.strategy)
@@ -122,23 +138,45 @@ def run_backtest(req: BacktestRequest):
         # Bad parameter names, un-coercible values, and the dataclasses' own
         # rules (fast < slow, thresholds in order) all surface as ValueError.
         signals, params = strategy.run(df, req.params)
+        config = build_config(req.config)
+        result = engine.run(df, signals["signal"], config, interval=req.interval)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except NotImplementedError as exc:
+        # A valid request for something not built yet — not the user's mistake.
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
 
-    signals = signals.copy()
-    signals["position"] = lag(signals["signal"])
-    bars = to_records(df.join(signals))
+    curve = to_records(
+        pd.DataFrame(
+            {
+                "equity": result.equity,
+                "benchmark": result.benchmark_equity,
+                # Saves the UI recomputing a running maximum to draw the
+                # underwater chart.
+                "drawdown": metrics.drawdown_series(result.equity),
+            }
+        )
+    )
 
-    return {
+    response = {
         "ticker": req.ticker.strip().upper(),
         "interval": req.interval,
         "strategy": {"slug": strategy.slug, "name": strategy.name},
-        # Echo the full resolved parameter set, not just what was sent, so the
-        # response says exactly what was run.
+        # Echo the fully resolved settings, not just what was sent, so the
+        # response states exactly what was run.
         "params": registry.params_as_dict(params),
-        "start": bars[0]["date"],
-        "end": bars[-1]["date"],
-        "count": len(bars),
-        "trades": int((signals["signal"].diff() == 1).sum()),
-        "bars": bars,
+        "config": asdict(config),
+        "start": curve[0]["date"],
+        "end": curve[-1]["date"],
+        "count": len(curve),
+        "metrics": result.metrics,
+        "equity": curve,
+        "trades": trades_mod.to_records(result.trades),
     }
+
+    if req.include_bars:
+        bars = signals.copy()
+        bars["position"] = result.position
+        response["bars"] = to_records(df.join(bars))
+
+    return response
