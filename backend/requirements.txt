@@ -1,9 +1,9 @@
-requests
 fastapi
 uvicorn
-google-genai
-sqlalchemy
-psycopg2-binary
-python-dotenv
-yfinance
 pandas
+numpy
+yfinance
+requests
+python-dotenv
+
+

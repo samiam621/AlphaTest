@@ -1,0 +1,28 @@
+# Render Blueprint for the backend. 
+
+databases:
+  - name: alphatest-db
+    plan: free 
+    databaseName: alphatest
+    user: alphatest
+
+services:
+  - type: web
+    name: alphatest-api
+    runtime: python
+    plan: free 
+    # Both commands run from the repository root
+    # it cannot be started from
+    # inside backend/.
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT --proxy-headers
+    healthCheckPath: /api/health
+    envVars:
+      # Render generates the password and injects the whole connection string,
+      # so no credential is ever written down here or in the dashboard. This is
+      # the internal URL: it stays inside Render's network, which is why it
+      # needs no sslmode. Locally, DATABASE_URL comes from .env instead.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: alphatest-db
+          property: connectionString

@@ -1,3 +1,4 @@
+import os
 from dataclasses import asdict
 
 import pandas as pd
@@ -23,6 +24,13 @@ origins = [
     "http://127.0.0.1:5173",
 ]
 
+
+origins += [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -30,6 +38,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+
+@app.get("/api/health")
+def health():
+    """Liveness probe for the host's health check, and a cheap keep-warm ping."""
+    return {"status": "ok"}
 
 
 @app.get("/api/data")
