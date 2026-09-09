@@ -84,9 +84,8 @@ class BacktestConfig:
     #               actually reachable.
     execution: str = field(default="close", metadata={"choices": EXECUTION_MODELS})
 
-    # Annualised, as a decimal: 0.04 is 4%. Used as the hurdle in Sharpe and
-    # Sortino. Negative is allowed — real policy rates have been.
-    risk_free_rate: float = 0.1
+    # risk_free_rate of U.S 10 year treasury as default
+    risk_free_rate: float = 0.04841
 
     def __post_init__(self) -> None:
         if self.initial_capital <= 0:

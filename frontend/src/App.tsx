@@ -280,7 +280,7 @@ function SchemaField({
       value={value}
       onChange={onChange}
       type={spec.type === "int" || spec.type === "float" ? "number" : "text"}
-      step={spec.type === "int" ? "1" : spec.type === "float" ? "any" : undefined}
+      step={spec.type === "int" ? "0.01" : spec.type === "float" ? "0.01" : undefined}
     />
   );
 }
