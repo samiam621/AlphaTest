@@ -70,12 +70,9 @@ class BacktestConfig:
 
     initial_capital: float = 10_000.0
 
-    # Per side, in basis points (1 bp = 0.01%). A round trip pays both of these
-    # twice: once getting in, once getting out.
+    # Per side, in basis points (1 bp = 0.01%). A round trip pays commission
+    # when getting in and out.
     commission_bps: float = 0.0
-    # The gap between the price you modelled and the price you got. Kept apart
-    # from commission because they are worth tuning independently.
-    slippage_bps: float = 0.0
 
     # "close"     — fill at the close of the bar that produced the signal.
     #               Standard, and slightly optimistic: you are trading at a
@@ -92,7 +89,7 @@ class BacktestConfig:
             raise ValueError(
                 f"initial_capital must be positive, got {self.initial_capital}"
             )
-        for name in ("commission_bps", "slippage_bps"):
+        for name in ("commission_bps",):
             value = getattr(self, name)
             if value < 0:
                 raise ValueError(f"{name} cannot be negative, got {value}")
@@ -116,7 +113,7 @@ class BacktestConfig:
     @property
     def cost_rate(self) -> float:
         """Cost of one side of a trade, as a fraction of the traded value."""
-        return (self.commission_bps + self.slippage_bps) / 10_000
+        return self.commission_bps / 10_000
 
 
 def build_config(values: Mapping[str, Any] | None = None) -> BacktestConfig:

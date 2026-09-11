@@ -56,6 +56,57 @@ function submitted(values: Values): Record<string, string> {
   );
 }
 
+// ─── Share links ──────────────────────────────────────────────────────────────
+//
+// A backtest is fully described by its request, so a share link is just the
+// request flattened into the query string: top-level fields as-is, strategy
+// params as `p.<name>`, execution config as `c.<name>`. Nothing is stored
+// server-side — the recipient's page rebuilds the form and re-runs.
+
+type ShareableRequest = {
+  ticker: string;
+  period: string | null;
+  start: string | null;
+  end: string | null;
+  interval: string;
+  strategy: string;
+  params: Record<string, string>;
+  config: Record<string, string>;
+};
+
+function toSearch(body: ShareableRequest): string {
+  const q = new URLSearchParams();
+  q.set("ticker", body.ticker);
+  if (body.period) q.set("period", body.period);
+  if (body.start) q.set("start", body.start);
+  if (body.end) q.set("end", body.end);
+  q.set("interval", body.interval);
+  q.set("strategy", body.strategy);
+  for (const [k, v] of Object.entries(body.params)) q.set(`p.${k}`, v);
+  for (const [k, v] of Object.entries(body.config)) q.set(`c.${k}`, v);
+  return q.toString();
+}
+
+function fromSearch(search: string) {
+  const q = new URLSearchParams(search);
+  const params: Values = {};
+  const config: Values = {};
+  for (const [k, v] of q) {
+    if (k.startsWith("p.")) params[k.slice(2)] = v;
+    else if (k.startsWith("c.")) config[k.slice(2)] = v;
+  }
+  return {
+    ticker: q.get("ticker"),
+    period: q.get("period"),
+    start: q.get("start"),
+    end: q.get("end"),
+    interval: q.get("interval"),
+    strategy: q.get("strategy"),
+    params,
+    config,
+  };
+}
+
 const MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 // Suggestions only — the ticker box is free text, because the backend will
@@ -280,7 +331,7 @@ function SchemaField({
       value={value}
       onChange={onChange}
       type={spec.type === "int" || spec.type === "float" ? "number" : "text"}
-      step={spec.type === "int" ? "0.01" : spec.type === "float" ? "0.01" : undefined}
+      step={spec.name === "risk_free_rate" ? "0.00001" : undefined}
     />
   );
 }
@@ -374,6 +425,7 @@ export default function App() {
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"nav" | "drawdown" | "monthly">("nav");
+  const [copied, setCopied] = useState(false);
 
   const strategy = strategies.find((s) => s.slug === slug);
 
@@ -425,6 +477,20 @@ export default function App() {
     }
   }, []);
 
+  const share = useCallback(async () => {
+    const url = `${window.location.origin}${window.location.pathname}?${toSearch(requestRef.current())}`;
+    window.history.replaceState(null, "", url);
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard is blocked (insecure origin, denied permission) — the URL is
+      // already in the address bar, so the user can copy it from there.
+      setRunError("Couldn't copy automatically — copy the link from the address bar.");
+    }
+  }, []);
+
   // Load both schemas, then run once so the screen opens with real numbers
   // instead of an empty frame.
   useEffect(() => {
@@ -438,13 +504,26 @@ export default function App() {
         ]);
         if (cancelled) return;
 
+        // A share link overlays the schema defaults; anything it omits or
+        // names wrongly just falls through to the defaults (or a backend 400).
+        const shared = fromSearch(window.location.search);
+        const sharedSlug = catalogue.some((s) => s.slug === shared.strategy) ? shared.strategy! : null;
+        const defaults = Object.fromEntries(catalogue.map((s) => [s.slug, defaultsOf(s.params)]));
+        if (sharedSlug) defaults[sharedSlug] = { ...defaults[sharedSlug], ...shared.params };
+
         setStrategies(catalogue);
         setConfigSpecs(config);
-        setConfigValues(defaultsOf(config));
-        setParamsBySlug(
-          Object.fromEntries(catalogue.map((s) => [s.slug, defaultsOf(s.params)])),
-        );
-        setSlug(catalogue[0]?.slug ?? "");
+        setConfigValues({ ...defaultsOf(config), ...shared.config });
+        setParamsBySlug(defaults);
+        if (shared.ticker) setTicker(shared.ticker.toUpperCase());
+        if (shared.interval) setInterval(shared.interval);
+        if (shared.period) setPeriod(shared.period);
+        if (shared.start || shared.end) {
+          setRangeMode("custom");
+          setStart(shared.start ?? "");
+          setEnd(shared.end ?? "");
+        }
+        setSlug(sharedSlug ?? catalogue[0]?.slug ?? "");
         setLoadingSchema(false);
       } catch (err) {
         if (cancelled) return;
@@ -649,9 +728,24 @@ export default function App() {
             </div>
 
             <button
+              onClick={() => void share()}
+              disabled={!slug}
+              className="mt-1 py-2.5 rounded font-semibold text-xs tracking-widest uppercase transition-all"
+              style={{
+                background: "var(--secondary)",
+                color: copied ? "var(--gain)" : "var(--foreground)",
+                fontFamily: "var(--font-data)",
+                cursor: "pointer",
+                border: "1px solid var(--border)",
+              }}
+            >
+              {copied ? "Link copied" : "Share Results"}
+            </button>
+
+            <button
               onClick={() => void run()}
               disabled={running}
-              className="mt-1 py-2.5 rounded font-semibold text-xs tracking-widest uppercase transition-all"
+              className="py-2.5 rounded font-semibold text-xs tracking-widest uppercase transition-all"
               style={{
                 background: running ? "var(--muted)" : "var(--primary)",
                 color: running ? "var(--muted-foreground)" : "var(--primary-foreground)",
@@ -660,7 +754,7 @@ export default function App() {
                 border: "none",
               }}
             >
-              {running ? "Running…" : "Run Backtest"}
+              {running ? "Backtest is loading..." : "Run Backtest"}
             </button>
           </div>
         )}
@@ -685,7 +779,7 @@ export default function App() {
               </>
             ) : (
               <span className="text-sm" style={{ color: "var(--muted-foreground)" }}>
-                No backtest yet
+                Backtest is loading... (takes a while on the first load since I'm using a free Render instance.)
               </span>
             )}
           </div>
@@ -727,7 +821,7 @@ export default function App() {
               style={{ background: "var(--card)", borderColor: "var(--border)" }}
             >
               <p className="text-xs" style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}>
-                {running ? "Running backtest…" : "Pick a strategy and run a backtest."}
+                {running ? "Backtest is loading... (takes a while on the first load since I'm using a free Render instance.)" : "Pick a strategy and run a backtest."}
               </p>
             </div>
           ) : (
