@@ -28,6 +28,7 @@ from backend.app.strategies import (
     roc_momentum,
     rsi_threshold,
     stochastic_oscillator,
+    buy_and_hold,
 )
 
 class UnknownStrategyError(ValueError):
@@ -99,6 +100,7 @@ _STRATEGIES: tuple[Strategy, ...] = (
     _register(rsi_threshold, rsi_threshold.RsiThresholdParams),
     _register(bollinger_band_mean_reversion, bollinger_band_mean_reversion.BollingerMeanReversionParams),
     _register(stochastic_oscillator, stochastic_oscillator.StochasticParams),
+    _register(buy_and_hold, buy_and_hold.BuyAndHoldParams),
 )
 
 REGISTRY: dict[str, Strategy] = {s.slug: s for s in _STRATEGIES}

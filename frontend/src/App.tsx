@@ -116,7 +116,7 @@ function thin<T>(points: T[]): T[] {
   return kept;
 }
 
-const LOADING_NOTE = "Backtest is loading... (takes a while on the first load since I'm using a free Render instance.)";
+const LOADING_NOTE = "Backtest is loading... ";
 
 const MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -1043,7 +1043,7 @@ export default function App() {
               style={{ background: "var(--card)", borderColor: "var(--border)" }}
             >
               <p className="text-xs" style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}>
-                {running ? LOADING_NOTE : "Backtest is loading..."}
+                {LOADING_NOTE}
               </p>
             </div>
           ) : (
