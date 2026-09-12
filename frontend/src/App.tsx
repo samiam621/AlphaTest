@@ -59,29 +59,61 @@ function submitted(values: Values): Record<string, string> {
 
 // ─── Share links ──────────────────────────────────────────────────────────────
 //
-// A backtest is fully described by its request, so a share link is just the
-// request flattened into the query string: top-level fields as-is, strategy
-// params as `p.<name>`, execution config as `c.<name>`. Nothing is stored
-// server-side — the recipient's page rebuilds the form and re-runs.
+// A backtest is fully described by its requests, so a share link is just those
+// flattened into the query string: range fields as-is, `tickers` and
+// `strategies` as parallel comma lists, strategy params as `p.<slug>.<name>`,
+// execution config as `c.<name>`. Nothing is stored server-side — the
+// recipient's page rebuilds the form and re-runs.
 
-function toSearch(body: BacktestRequest): string {
+/** One backtest to run, labelled for the results view. */
+type Run = { label: string; body: BacktestRequest };
+
+function toSearch(runs: Run[]): string {
   const q = new URLSearchParams();
-  const { params, config, ...top } = body;
-  for (const [k, v] of Object.entries(top)) if (v) q.set(k, String(v));
-  for (const [k, v] of Object.entries(params)) q.set(`p.${k}`, String(v));
-  for (const [k, v] of Object.entries(config)) q.set(`c.${k}`, String(v));
+  const first = runs[0]?.body;
+  if (!first) return "";
+  for (const k of ["period", "start", "end", "interval"] as const) if (first[k]) q.set(k, String(first[k]));
+  q.set("tickers", runs.map((r) => r.body.ticker).join(","));
+  q.set("strategies", runs.map((r) => r.body.strategy).join(","));
+  for (const { body } of runs) {
+    for (const [k, v] of Object.entries(body.params)) q.set(`p.${body.strategy}.${k}`, String(v));
+  }
+  for (const [k, v] of Object.entries(first.config)) q.set(`c.${k}`, String(v));
   return q.toString();
 }
 
 function fromSearch(search: string) {
   const q = new URLSearchParams(search);
-  const params: Values = {};
+  // Older links carried one `ticker`, one `strategy`, and flat `p.<name>` keys.
+  const tickers = (q.get("tickers") ?? q.get("ticker") ?? "").split(",").filter(Boolean);
+  const strategies = (q.get("strategies") ?? q.get("strategy") ?? "").split(",");
+  const params: Record<string, Values> = {};
   const config: Values = {};
   for (const [k, v] of q) {
-    if (k.startsWith("p.")) params[k.slice(2)] = v;
-    else if (k.startsWith("c.")) config[k.slice(2)] = v;
+    if (k.startsWith("p.")) {
+      const [a, b] = k.slice(2).split(".");
+      const [slug, name] = b === undefined ? [strategies[0], a] : [a, b];
+      if (slug) (params[slug] ??= {})[name] = v;
+    } else if (k.startsWith("c.")) config[k.slice(2)] = v;
   }
-  return { q, params, config };
+  return { q, tickers, strategies, params, config };
+}
+
+const MAX_TICKERS = 5;
+// First entry is the old single-strategy colour, so one ticker looks as before.
+const SERIES_COLORS = ["var(--gain)", "#f5a623", "#c084fc", "#38bdf8", "#f472b6"];
+
+/**
+ * Thin a curve for the chart: ten years of daily bars is 2500 points, and an
+ * SVG path with one node per pixel column looks the same as one with four.
+ * The final bar carries the headline return; never let it fall in a gap.
+ */
+function thin<T>(points: T[]): T[] {
+  const step = Math.max(1, Math.floor(points.length / 400));
+  const kept = points.filter((_, i) => i % step === 0);
+  const last = points[points.length - 1];
+  if (last && kept[kept.length - 1] !== last) kept.push(last);
+  return kept;
 }
 
 const LOADING_NOTE = "Backtest is loading... (takes a while on the first load since I'm using a free Render instance.)";
@@ -333,6 +365,41 @@ function Divider() {
   return <div className="h-px" style={{ background: "var(--border)" }} />;
 }
 
+function TabBar<T extends string>({
+  tabs,
+  active,
+  onChange,
+  dense = false,
+}: {
+  tabs: { value: T; label: string }[];
+  active: T;
+  onChange: (t: T) => void;
+  /** Tighter spacing for the narrow sidebar. */
+  dense?: boolean;
+}) {
+  return (
+    <div className={`flex items-center gap-0 border-b pt-3 shrink-0 ${dense ? "px-2" : "px-4"}`} style={{ borderColor: "var(--border)" }}>
+      {tabs.map((tab) => (
+        <button
+          key={tab.value}
+          onClick={() => onChange(tab.value)}
+          className={`pb-2.5 font-medium tracking-wide uppercase transition-colors border-b-2 ${dense ? "px-2 text-[11px]" : "px-3 text-xs"}`}
+          style={{
+            fontFamily: "var(--font-data)",
+            borderColor: active === tab.value ? "var(--primary)" : "transparent",
+            color: active === tab.value ? "var(--primary)" : "var(--muted-foreground)",
+            background: "none",
+            cursor: "pointer",
+            letterSpacing: "0.08em",
+          }}
+        >
+          {tab.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function StatRow({
   label,
   value,
@@ -384,33 +451,53 @@ export default function App() {
   const [schemaError, setSchemaError] = useState<string | null>(null);
   const [loadingSchema, setLoadingSchema] = useState(true);
 
-  // Data selection.
-  const [ticker, setTicker] = useState("AAPL");
+  // Data selection. Each row pairs a ticker with the strategy that runs on it;
+  // the range and interval are shared by every row.
+  const [rows, setRows] = useState<{ ticker: string; slug: string; hidden?: boolean }[]>([{ ticker: "AAPL", slug: "" }]);
   const [rangeMode, setRangeMode] = useState<"period" | "custom">("period");
   const [period, setPeriod] = useState("2y");
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [interval, setInterval] = useState("1d");
 
-  // Strategy selection, with one set of parameter values per strategy so
-  // switching away and back does not lose what was typed.
-  const [slug, setSlug] = useState("");
+  // One set of parameter values per strategy, shared by every ticker running
+  // it, so switching away and back does not lose what was typed.
   const [paramsBySlug, setParamsBySlug] = useState<Record<string, Values>>({});
   const [configValues, setConfigValues] = useState<Values>({});
   const [showSettings, setShowSettings] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarTab, setSidebarTab] = useState<"tickers" | "strategy" | "params">("tickers");
 
-  // Run state.
-  const [result, setResult] = useState<BacktestResponse | null>(null);
+  // Run state: one result per run label, and which one fills the detail view.
+  const [results, setResults] = useState<Record<string, BacktestResponse>>({});
+  const [selected, setSelected] = useState("");
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"nav" | "drawdown" | "monthly">("nav");
   const [copied, setCopied] = useState(false);
 
-  const strategy = strategies.find((s) => s.slug === slug);
+  const strategyOf = (slug: string) => strategies.find((s) => s.slug === slug);
+  // Strategies in use, in the order they first appear in the Strategy tab, so
+  // the Params tab reads top-to-bottom the same way.
+  const usedSlugs = [...new Set(rows.map((r) => r.slug).filter(Boolean))];
 
   // The request builder reads current form state, so it is rebuilt on every
-  // change; `run` below depends on it.
-  const buildRequest = useCallback(() => {
+  // change; `run` below depends on it. This is the one place form state turns
+  // into requests — a pair-trading run would be one more entry here.
+  const tickerOf = (r: { ticker: string }) => r.ticker.trim().toUpperCase();
+  // The same ticker under two strategies is a legitimate comparison, so
+  // label it by both. This label keys `results` and the chart series.
+  const labelOf = useCallback(
+    (row: { ticker: string; slug: string }) => {
+      const t = tickerOf(row);
+      const repeated = rows.filter((r) => tickerOf(r) === t).length > 1;
+      return repeated ? `${t} · ${strategies.find((s) => s.slug === row.slug)?.name ?? row.slug}` : t;
+    },
+    [rows, strategies],
+  );
+  const hiddenLabels = new Set(rows.filter((r) => r.hidden).map(labelOf));
+
+  const buildRequests = useCallback((): Run[] => {
     // The backend rejects a request carrying both a period and explicit dates,
     // so the mode toggle decides which pair goes in.
     const range =
@@ -418,42 +505,61 @@ export default function App() {
         ? { period, start: null, end: null }
         : { period: null, start: start || null, end: end || null };
 
-    return {
-      ticker: ticker.trim(),
-      ...range,
-      interval,
-      strategy: slug,
-      params: submitted(paramsBySlug[slug] ?? {}),
-      config: submitted(configValues),
-      // The per-bar frame is the largest part of the response and nothing on
-      // this screen reads it.
-      include_bars: false,
-    };
-  }, [ticker, rangeMode, period, start, end, interval, slug, paramsBySlug, configValues]);
+    const seen = new Set<string>();
+    const runs: Run[] = [];
+    for (const row of rows) {
+      const t = tickerOf(row);
+      const { slug } = row;
+      if (!t || !slug) continue;
+      // Only an exact repeat (same ticker, same strategy) is skipped.
+      const label = labelOf(row);
+      if (seen.has(label)) continue;
+      seen.add(label);
+      runs.push({
+        label,
+        body: {
+          ticker: t,
+          ...range,
+          interval,
+          strategy: slug,
+          params: submitted(paramsBySlug[slug] ?? {}),
+          config: submitted(configValues),
+          // The per-bar frame is the largest part of the response and nothing
+          // on this screen reads it.
+          include_bars: false,
+        },
+      });
+    }
+    return runs;
+  }, [rows, labelOf, rangeMode, period, start, end, interval, paramsBySlug, configValues]);
 
-  const requestRef = useRef(buildRequest);
-  requestRef.current = buildRequest;
+  const requestRef = useRef(buildRequests);
+  requestRef.current = buildRequests;
 
   const run = useCallback(async () => {
-    const body = requestRef.current();
-    if (!body.ticker) {
+    const runs = requestRef.current();
+    if (!runs.length) {
       setRunError("Enter a ticker to backtest.");
       return;
     }
-    if (!body.strategy) return;
 
     setRunning(true);
     setRunError(null);
-    try {
-      setResult(await runBacktest(body));
-    } catch (err) {
-      // A 400 here is almost always the user's input — an unknown ticker, a
-      // start date past the intraday lookback, fast >= slow — and the backend's
-      // message says which, so show it rather than a generic failure.
-      setRunError(err instanceof ApiError ? err.message : String(err));
-    } finally {
-      setRunning(false);
-    }
+    // One bad ticker should not sink the others, so every run settles and the
+    // failures are listed together. A 400 is almost always the user's input —
+    // an unknown ticker, a start date past the intraday lookback, fast >= slow
+    // — and the backend's message says which, so show it verbatim.
+    const settled = await Promise.allSettled(runs.map((r) => runBacktest(r.body)));
+    const next: Record<string, BacktestResponse> = {};
+    const errors: string[] = [];
+    settled.forEach((s, i) => {
+      if (s.status === "fulfilled") next[runs[i].label] = s.value;
+      else errors.push(`${runs[i].label}: ${s.reason instanceof ApiError ? s.reason.message : String(s.reason)}`);
+    });
+    setResults(next);
+    setSelected((sel) => (next[sel] ? sel : Object.keys(next)[0] ?? ""));
+    setRunError(errors.length ? errors.join("\n") : null);
+    setRunning(false);
   }, []);
 
   const share = useCallback(async () => {
@@ -486,16 +592,25 @@ export default function App() {
         // A share link overlays the schema defaults; anything it omits or
         // names wrongly just falls through to the defaults (or a backend 400).
         const shared = fromSearch(window.location.search);
-        const sharedSlug = catalogue.some((s) => s.slug === shared.q.get("strategy")) ? shared.q.get("strategy") : null;
+        const known = (slug: string | undefined) => catalogue.some((s) => s.slug === slug);
+        const first = catalogue[0]?.slug ?? "";
         const defaults = Object.fromEntries(catalogue.map((s) => [s.slug, defaultsOf(s.params)]));
-        if (sharedSlug) defaults[sharedSlug] = { ...defaults[sharedSlug], ...shared.params };
+        for (const [slug, values] of Object.entries(shared.params)) {
+          if (known(slug)) defaults[slug] = { ...defaults[slug], ...values };
+        }
 
         setStrategies(catalogue);
         setConfigSpecs(config);
         setConfigValues({ ...defaultsOf(config), ...shared.config });
         setParamsBySlug(defaults);
-        const [ticker, interval, period, start, end] = ["ticker", "interval", "period", "start", "end"].map((k) => shared.q.get(k));
-        if (ticker) setTicker(ticker.toUpperCase());
+        const tickers = shared.tickers.length ? shared.tickers.slice(0, MAX_TICKERS) : ["AAPL"];
+        setRows(
+          tickers.map((t, i) => ({
+            ticker: t.toUpperCase(),
+            slug: known(shared.strategies[i]) ? shared.strategies[i] : first,
+          })),
+        );
+        const [interval, period, start, end] = ["interval", "period", "start", "end"].map((k) => shared.q.get(k));
         if (interval) setInterval(interval);
         if (period) setPeriod(period);
         if (start || end) {
@@ -503,7 +618,6 @@ export default function App() {
           setStart(start ?? "");
           setEnd(end ?? "");
         }
-        setSlug(sharedSlug ?? catalogue[0]?.slug ?? "");
         setLoadingSchema(false);
       } catch (err) {
         if (cancelled) return;
@@ -517,21 +631,25 @@ export default function App() {
     };
   }, []);
 
-  // `slug` is set only once the catalogue has loaded, so this fires exactly
-  // once, after the form has real defaults in it.
+  // Fires exactly once, after the schema load has put real defaults in the form.
   const autoRan = useRef(false);
   useEffect(() => {
-    if (!slug || autoRan.current) return;
+    if (loadingSchema || schemaError || autoRan.current) return;
     autoRan.current = true;
     void run();
-  }, [slug, run]);
+  }, [loadingSchema, schemaError, run]);
 
-  const setParam = (name: string, value: string) =>
+  const setRow = (i: number, patch: Partial<{ ticker: string; slug: string; hidden?: boolean }>) =>
+    setRows((all) => all.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+
+  const setParam = (slug: string, name: string, value: string) =>
     setParamsBySlug((all) => ({ ...all, [slug]: { ...all[slug], [name]: value } }));
 
   const setConfigValue = (name: string, value: string) =>
     setConfigValues((c) => ({ ...c, [name]: value }));
 
+  const labels = Object.keys(results);
+  const result = results[selected];
   const metrics = result?.metrics;
   const benchmark = metrics?.benchmark;
   const trades = result?.trades ?? [];
@@ -543,23 +661,28 @@ export default function App() {
       ? metrics.total_return - benchmark.total_return
       : null;
 
-  // Thin the curve for the chart: ten years of daily bars is 2500 points, and
-  // an SVG path with one node per pixel column looks the same as one with four.
+  // Every run's curve merged by date into one table (`eq_<label>` columns) so
+  // they overlay on one chart; runs share initial_equity, so raw dollars are
+  // comparable. Benchmark and drawdown come from the selected run only.
+  // Different tickers trade on different days (BTC-USD has weekends), hence
+  // the merge rather than a zip.
   const chartData = useMemo(() => {
-    if (!result) return [];
-    const points = result.equity;
-    const step = Math.max(1, Math.floor(points.length / 400));
-    const kept = points.filter((_, i) => i % step === 0);
-    const last = points[points.length - 1];
-    // The final bar carries the headline return; never let it fall in a gap.
-    if (last && kept[kept.length - 1] !== last) kept.push(last);
-    return kept.map((p) => ({
-      date: day(p.date),
-      equity: p.equity,
-      benchmark: p.benchmark,
-      drawdown: p.drawdown == null ? null : p.drawdown * 100,
-    }));
-  }, [result]);
+    const byDate = new Map<string, Record<string, string | number | null>>();
+    for (const [label, r] of Object.entries(results)) {
+      for (const p of thin(r.equity)) {
+        const row = byDate.get(p.date) ?? { date: p.date };
+        row[`eq_${label}`] = p.equity;
+        if (label === selected) {
+          row.benchmark = p.benchmark;
+          row.drawdown = p.drawdown == null ? null : p.drawdown * 100;
+        }
+        byDate.set(p.date, row);
+      }
+    }
+    return [...byDate.keys()]
+      .sort()
+      .map((d) => ({ ...byDate.get(d)!, date: day(d) }));
+  }, [results, selected]);
 
   const monthly = useMemo(() => (result ? monthlyReturns(result.equity) : []), [result]);
 
@@ -587,6 +710,7 @@ export default function App() {
   return (
     <div className="flex h-full overflow-hidden" style={{ background: "var(--background)", fontFamily: "var(--font-ui)" }}>
       {/* ── Sidebar ── */}
+      {sidebarOpen && (
       <aside
         className="flex flex-col w-56 shrink-0 border-r overflow-y-auto"
         style={{ background: "#090b18", borderColor: "var(--border)" }}
@@ -612,133 +736,212 @@ export default function App() {
             {schemaError}
           </p>
         ) : (
-          <div className="flex flex-col gap-4 p-4">
-            <SidebarSection title="Universe">
-              <TextField
-                label="Ticker"
-                value={ticker}
-                onChange={(v) => setTicker(v.toUpperCase())}
-                placeholder="Enter a ticker:ex.AAPL"
-              />
+          <>
+            <TabBar
+              tabs={[
+                { value: "tickers", label: "Tickers" },
+                { value: "strategy", label: "Strategy" },
+                { value: "params", label: "Params" },
+              ]}
+              active={sidebarTab}
+              onChange={setSidebarTab}
+              dense
+            />
+            <div className="flex flex-col gap-4 p-4">
+              {sidebarTab === "tickers" && (
+                <SidebarSection title="Universe">
+                  {rows.map((r, i) => (
+                    <div key={i} className="flex items-end gap-1.5">
+                      <div className="flex-1">
+                        <TextField
+                          label={`Ticker ${i + 1}`}
+                          value={r.ticker}
+                          onChange={(v) => setRow(i, { ticker: v.toUpperCase() })}
+                          list="tickers"
+                          placeholder="Enter a ticker:ex.AAPL"
+                        />
+                      </div>
+                      <button
+                        onClick={() => setRow(i, { hidden: !r.hidden })}
+                        title={r.hidden ? "Show curve" : "Hide curve"}
+                        aria-pressed={!!r.hidden}
+                        className="px-2 py-1.5 rounded"
+                        style={{ ...FIELD_STYLE, cursor: "pointer", color: r.hidden ? "var(--muted-foreground)" : "var(--foreground)" }}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                          <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" />
+                          <circle cx="12" cy="12" r="3.5" />
+                          {r.hidden && <path d="M3 21 21 3" />}
+                        </svg>
+                      </button>
+                      {rows.length > 1 && (
+                        <button
+                          onClick={() => setRows((all) => all.filter((_, j) => j !== i))}
+                          title="Remove ticker"
+                          className="px-2 py-1.5 rounded text-sm"
+                          style={{ ...FIELD_STYLE, cursor: "pointer", color: "var(--muted-foreground)" }}
+                        >
+                          ×
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  <datalist id="tickers">
+                    {TICKER_SUGGESTIONS.map((t) => (
+                      <option key={t} value={t} />
+                    ))}
+                  </datalist>
+                  <button
+                    onClick={() => setRows((all) => [...all, { ticker: "", slug: strategies[0]?.slug ?? "" }])}
+                    disabled={rows.length >= MAX_TICKERS}
+                    className="py-1.5 rounded text-[10px] tracking-widest uppercase font-medium"
+                    style={{
+                      ...FIELD_STYLE,
+                      cursor: rows.length >= MAX_TICKERS ? "not-allowed" : "pointer",
+                      color: rows.length >= MAX_TICKERS ? "var(--muted-foreground)" : "var(--foreground)",
+                    }}
+                  >
+                    {rows.length >= MAX_TICKERS ? `Max ${MAX_TICKERS} tickers` : "+ Add ticker"}
+                  </button>
 
-              <Select
-                label="Range"
-                value={rangeMode}
-                options={[
-                  { value: "period", label: "Preset period" },
-                  { value: "custom", label: "Custom dates" },
-                ]}
-                onChange={(v) => setRangeMode(v as "period" | "custom")}
-              />
-              {rangeMode === "period" ? (
-                <Select
-                  label="Period"
-                  value={period}
-                  options={PERIODS.map((p) => ({ value: p, label: p }))}
-                  onChange={setPeriod}
-                />
-              ) : (
+                  <Select
+                    label="Range"
+                    value={rangeMode}
+                    options={[
+                      { value: "period", label: "Preset period" },
+                      { value: "custom", label: "Custom dates" },
+                    ]}
+                    onChange={(v) => setRangeMode(v as "period" | "custom")}
+                  />
+                  {rangeMode === "period" ? (
+                    <Select
+                      label="Period"
+                      value={period}
+                      options={PERIODS.map((p) => ({ value: p, label: p }))}
+                      onChange={setPeriod}
+                    />
+                  ) : (
+                    <>
+                      <TextField label="Start" value={start} onChange={setStart} type="date" />
+                      <TextField label="End" value={end} onChange={setEnd} type="date" />
+                    </>
+                  )}
+                  <Select
+                    label="Interval"
+                    value={interval}
+                    options={INTERVALS.map((i) => ({ value: i, label: i }))}
+                    onChange={setInterval}
+                  />
+                </SidebarSection>
+              )}
+
+              {sidebarTab === "strategy" && (
+                <SidebarSection title="Strategy per ticker">
+                  {rows.map((r, i) => (
+                    <div key={i} className="flex flex-col gap-1">
+                      <Select
+                        label={`#${i + 1} ${r.ticker || "(no ticker)"}`}
+                        value={r.slug}
+                        options={strategies.map((s) => ({ value: s.slug, label: s.name }))}
+                        onChange={(slug) => setRow(i, { slug })}
+                      />
+                      {strategyOf(r.slug)?.description && (
+                        <p className="text-[10px] leading-snug" style={{ color: "var(--muted-foreground)" }}>
+                          {strategyOf(r.slug)?.description}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </SidebarSection>
+              )}
+
+              {sidebarTab === "params" && (
                 <>
-                  <TextField label="Start" value={start} onChange={setStart} type="date" />
-                  <TextField label="End" value={end} onChange={setEnd} type="date" />
+                  {usedSlugs.map((slug, i) => (
+                    <SidebarSection key={slug} title={`#${i + 1} ${strategyOf(slug)?.name ?? slug}`}>
+                      <p className="text-[10px] -mt-2" style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}>
+                        {rows.filter((r) => r.slug === slug).map((r) => r.ticker).join(", ")}
+                      </p>
+                      {strategyOf(slug)?.params.map((spec) => (
+                        <SchemaField
+                          key={spec.name}
+                          spec={spec}
+                          value={paramsBySlug[slug]?.[spec.name] ?? ""}
+                          onChange={(v) => setParam(slug, spec.name, v)}
+                        />
+                      ))}
+                    </SidebarSection>
+                  ))}
+
+                  <Divider />
+
+                  <div>
+                    <button
+                      onClick={() => setShowSettings((s) => !s)}
+                      className="flex items-center justify-between w-full text-[9px] font-semibold tracking-widest uppercase mb-3"
+                      style={{
+                        color: "var(--muted-foreground)",
+                        fontFamily: "var(--font-data)",
+                        background: "none",
+                        border: "none",
+                        padding: 0,
+                        cursor: "pointer",
+                      }}
+                    >
+                      <span>Execution &amp; Costs</span>
+                      <span>{showSettings ? "−" : "+"}</span>
+                    </button>
+                    {showSettings && (
+                      <div className="flex flex-col gap-3">
+                        {configSpecs.map((spec) => (
+                          <SchemaField
+                            key={spec.name}
+                            spec={spec}
+                            value={configValues[spec.name] ?? ""}
+                            onChange={(v) => setConfigValue(spec.name, v)}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </>
               )}
-              <Select
-                label="Interval"
-                value={interval}
-                options={INTERVALS.map((i) => ({ value: i, label: i }))}
-                onChange={setInterval}
-              />
-            </SidebarSection>
 
-            <Divider />
+              <Divider />
 
-            <SidebarSection title="Strategy">
-              <Select
-                label="Model"
-                value={slug}
-                options={strategies.map((s) => ({ value: s.slug, label: s.name }))}
-                onChange={setSlug}
-              />
-              {strategy?.description && (
-                <p className="text-[10px] leading-snug" style={{ color: "var(--muted-foreground)" }}>
-                  {strategy.description}
-                </p>
-              )}
-              {strategy?.params.map((spec) => (
-                <SchemaField
-                  key={spec.name}
-                  spec={spec}
-                  value={paramsBySlug[slug]?.[spec.name] ?? ""}
-                  onChange={(v) => setParam(spec.name, v)}
-                />
-              ))}
-            </SidebarSection>
-
-            <Divider />
-
-            <div>
               <button
-                onClick={() => setShowSettings((s) => !s)}
-                className="flex items-center justify-between w-full text-[9px] font-semibold tracking-widest uppercase mb-3"
+                onClick={() => void share()}
+                className="mt-1 py-2.5 rounded font-semibold text-xs tracking-widest uppercase transition-all"
                 style={{
-                  color: "var(--muted-foreground)",
+                  background: "var(--secondary)",
+                  color: copied ? "var(--gain)" : "var(--foreground)",
                   fontFamily: "var(--font-data)",
-                  background: "none",
-                  border: "none",
-                  padding: 0,
                   cursor: "pointer",
+                  border: "1px solid var(--border)",
                 }}
               >
-                <span>Execution &amp; Costs</span>
-                <span>{showSettings ? "−" : "+"}</span>
+                {copied ? "Link copied" : "Share Results"}
               </button>
-              {showSettings && (
-                <div className="flex flex-col gap-3">
-                  {configSpecs.map((spec) => (
-                    <SchemaField
-                      key={spec.name}
-                      spec={spec}
-                      value={configValues[spec.name] ?? ""}
-                      onChange={(v) => setConfigValue(spec.name, v)}
-                    />
-                  ))}
-                </div>
-              )}
+
+              <button
+                onClick={() => void run()}
+                disabled={running}
+                className="py-2.5 rounded font-semibold text-xs tracking-widest uppercase transition-all"
+                style={{
+                  background: running ? "var(--muted)" : "var(--primary)",
+                  color: running ? "var(--muted-foreground)" : "var(--primary-foreground)",
+                  fontFamily: "var(--font-data)",
+                  cursor: running ? "not-allowed" : "pointer",
+                  border: "none",
+                }}
+              >
+                {running ? "Backtest is loading..." : "Run Backtest"}
+              </button>
             </div>
-
-            <button
-              onClick={() => void share()}
-              disabled={!slug}
-              className="mt-1 py-2.5 rounded font-semibold text-xs tracking-widest uppercase transition-all"
-              style={{
-                background: "var(--secondary)",
-                color: copied ? "var(--gain)" : "var(--foreground)",
-                fontFamily: "var(--font-data)",
-                cursor: "pointer",
-                border: "1px solid var(--border)",
-              }}
-            >
-              {copied ? "Link copied" : "Share Results"}
-            </button>
-
-            <button
-              onClick={() => void run()}
-              disabled={running}
-              className="py-2.5 rounded font-semibold text-xs tracking-widest uppercase transition-all"
-              style={{
-                background: running ? "var(--muted)" : "var(--primary)",
-                color: running ? "var(--muted-foreground)" : "var(--primary-foreground)",
-                fontFamily: "var(--font-data)",
-                cursor: running ? "not-allowed" : "pointer",
-                border: "none",
-              }}
-            >
-              {running ? "Backtest is loading..." : "Run Backtest"}
-            </button>
-          </div>
+          </>
         )}
       </aside>
+      )}
 
       {/* ── Main Panel ── */}
       <main className="flex-1 flex flex-col overflow-hidden">
@@ -746,10 +949,34 @@ export default function App() {
           className="flex items-center justify-between px-5 py-3 border-b shrink-0"
           style={{ background: "#090b18", borderColor: "var(--border)" }}
         >
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <button
+              onClick={() => setSidebarOpen((o) => !o)}
+              title={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+              className="px-2 py-1 rounded text-sm"
+              style={{ ...FIELD_STYLE, cursor: "pointer" }}
+            >
+              ☰
+            </button>
             {result ? (
               <>
-                <span className="ticker-badge">{result.ticker}</span>
+                {/* One badge per run; clicking picks which fills the detail view. */}
+                {labels.map((label, i) => (
+                  <button
+                    key={label}
+                    onClick={() => setSelected(label)}
+                    className="ticker-badge whitespace-nowrap"
+                    style={{
+                      cursor: "pointer",
+                      opacity: label === selected ? 1 : 0.5,
+                      color: SERIES_COLORS[i],
+                      borderColor: label === selected ? SERIES_COLORS[i] : "var(--border)",
+                      background: "transparent",
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
                 <span className="text-sm font-medium" style={{ color: "var(--foreground)" }}>
                   {result.strategy.name}
                 </span>
@@ -769,11 +996,13 @@ export default function App() {
                 {result.count} bars
               </span>
             )}
-            <div className="flex items-center gap-1.5 text-xs" style={{ fontFamily: "var(--font-data)", color: "var(--gain)" }}>
-              <span className="w-2 h-2 rounded-full inline-block" style={{ background: "var(--gain)" }} />
-              Strategy
-            </div>
-            <div className="flex items-center gap-1.5 text-xs" style={{ fontFamily: "var(--font-data)", color: "var(--primary)" }}>
+            {(labels.length ? labels : ["Strategy"]).map((label, i) => (
+              <div key={label} className="flex items-center gap-1.5 text-xs whitespace-nowrap" style={{ fontFamily: "var(--font-data)", color: SERIES_COLORS[i] }}>
+                <span className="w-2 h-2 rounded-full inline-block" style={{ background: SERIES_COLORS[i] }} />
+                {label}
+              </div>
+            ))}
+            <div className="flex items-center gap-1.5 text-xs whitespace-nowrap" style={{ fontFamily: "var(--font-data)", color: "var(--primary)" }}>
               <span className="w-2 h-2 rounded-full inline-block" style={{ background: "var(--primary)" }} />
               Buy &amp; Hold
             </div>
@@ -783,7 +1012,7 @@ export default function App() {
         <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-5">
           {runError && (
             <div
-              className="rounded border px-4 py-3 text-xs"
+              className="rounded border px-4 py-3 text-xs whitespace-pre-line"
               style={{
                 background: "rgba(255,77,109,0.08)",
                 borderColor: "rgba(255,77,109,0.35)",
@@ -854,35 +1083,27 @@ export default function App() {
 
               {/* ── Chart Section ── */}
               <div className="rounded border flex flex-col" style={{ background: "var(--card)", borderColor: "var(--border)" }}>
-                <div className="flex items-center gap-0 border-b px-4 pt-3" style={{ borderColor: "var(--border)" }}>
-                  {(["nav", "drawdown", "monthly"] as const).map((tab) => (
-                    <button
-                      key={tab}
-                      onClick={() => setActiveTab(tab)}
-                      className="pb-2.5 px-3 text-xs font-medium tracking-wide uppercase transition-colors border-b-2"
-                      style={{
-                        fontFamily: "var(--font-data)",
-                        borderColor: activeTab === tab ? "var(--primary)" : "transparent",
-                        color: activeTab === tab ? "var(--primary)" : "var(--muted-foreground)",
-                        background: "none",
-                        cursor: "pointer",
-                        letterSpacing: "0.08em",
-                      }}
-                    >
-                      {tab === "nav" ? "Equity Curve" : tab === "drawdown" ? "Drawdown" : "Monthly Returns"}
-                    </button>
-                  ))}
-                </div>
+                <TabBar
+                  tabs={[
+                    { value: "nav", label: "Equity Curve" },
+                    { value: "drawdown", label: "Drawdown" },
+                    { value: "monthly", label: "Monthly Returns" },
+                  ]}
+                  active={activeTab}
+                  onChange={setActiveTab}
+                />
 
                 <div className="p-4" style={{ height: 320 }}>
                   {activeTab === "nav" && (
                     <ResponsiveContainer width="100%" height="100%">
                       <AreaChart data={chartData} margin={{ top: 4, right: 8, left: 4, bottom: 0 }}>
                         <defs>
-                          <linearGradient id="gainGrad" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%" stopColor="var(--gain)" stopOpacity={0.18} />
-                            <stop offset="95%" stopColor="var(--gain)" stopOpacity={0} />
-                          </linearGradient>
+                          {labels.map((label, i) => (
+                            <linearGradient key={label} id={`grad${i}`} x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor={SERIES_COLORS[i]} stopOpacity={0.18} />
+                              <stop offset="95%" stopColor={SERIES_COLORS[i]} stopOpacity={0} />
+                            </linearGradient>
+                          ))}
                           <linearGradient id="benchGrad" x1="0" y1="0" x2="0" y2="1">
                             <stop offset="5%" stopColor="var(--primary)" stopOpacity={0.12} />
                             <stop offset="95%" stopColor="var(--primary)" stopOpacity={0} />
@@ -920,17 +1141,21 @@ export default function App() {
                           activeDot={{ r: 3, fill: "var(--primary)" }}
                           connectNulls
                         />
-                        <Area
-                          type="monotone"
-                          dataKey="equity"
-                          name="Strategy"
-                          stroke="var(--gain)"
-                          strokeWidth={1.5}
-                          fill="url(#gainGrad)"
-                          dot={false}
-                          activeDot={{ r: 3, fill: "var(--gain)" }}
-                          connectNulls
-                        />
+                        {labels.map((label, i) => (
+                          <Area
+                            key={label}
+                            type="monotone"
+                            dataKey={`eq_${label}`}
+                            name={label}
+                            stroke={SERIES_COLORS[i]}
+                            hide={hiddenLabels.has(label)}
+                            strokeWidth={label === selected ? 2 : 1.25}
+                            fill={label === selected ? `url(#grad${i})` : "transparent"}
+                            dot={false}
+                            activeDot={{ r: 3, fill: SERIES_COLORS[i] }}
+                            connectNulls
+                          />
+                        ))}
                       </AreaChart>
                     </ResponsiveContainer>
                   )}
