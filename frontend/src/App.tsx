@@ -123,7 +123,7 @@ const MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "S
 // Suggestions only — the ticker box is free text, because the backend will
 // fetch anything Yahoo knows about.
 const TICKER_SUGGESTIONS = [
-  "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "SPY", "QQQ", "BTC-USD",
+  "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "SPY", "QQQ", "BTC-USD", "^FVX", "^TNX"
 ];
 
 // ─── Presentational pieces ────────────────────────────────────────────────────
