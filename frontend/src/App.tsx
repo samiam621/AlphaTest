@@ -17,6 +17,7 @@ import {
   fetchConfigSchema,
   fetchStrategies,
   runBacktest,
+  type BacktestRequest,
   type BacktestResponse,
   type ParamSpec,
   type StrategyInfo,
@@ -63,27 +64,12 @@ function submitted(values: Values): Record<string, string> {
 // params as `p.<name>`, execution config as `c.<name>`. Nothing is stored
 // server-side — the recipient's page rebuilds the form and re-runs.
 
-type ShareableRequest = {
-  ticker: string;
-  period: string | null;
-  start: string | null;
-  end: string | null;
-  interval: string;
-  strategy: string;
-  params: Record<string, string>;
-  config: Record<string, string>;
-};
-
-function toSearch(body: ShareableRequest): string {
+function toSearch(body: BacktestRequest): string {
   const q = new URLSearchParams();
-  q.set("ticker", body.ticker);
-  if (body.period) q.set("period", body.period);
-  if (body.start) q.set("start", body.start);
-  if (body.end) q.set("end", body.end);
-  q.set("interval", body.interval);
-  q.set("strategy", body.strategy);
-  for (const [k, v] of Object.entries(body.params)) q.set(`p.${k}`, v);
-  for (const [k, v] of Object.entries(body.config)) q.set(`c.${k}`, v);
+  const { params, config, ...top } = body;
+  for (const [k, v] of Object.entries(top)) if (v) q.set(k, String(v));
+  for (const [k, v] of Object.entries(params)) q.set(`p.${k}`, String(v));
+  for (const [k, v] of Object.entries(config)) q.set(`c.${k}`, String(v));
   return q.toString();
 }
 
@@ -95,17 +81,10 @@ function fromSearch(search: string) {
     if (k.startsWith("p.")) params[k.slice(2)] = v;
     else if (k.startsWith("c.")) config[k.slice(2)] = v;
   }
-  return {
-    ticker: q.get("ticker"),
-    period: q.get("period"),
-    start: q.get("start"),
-    end: q.get("end"),
-    interval: q.get("interval"),
-    strategy: q.get("strategy"),
-    params,
-    config,
-  };
+  return { q, params, config };
 }
+
+const LOADING_NOTE = "Backtest is loading... (takes a while on the first load since I'm using a free Render instance.)";
 
 const MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -507,7 +486,7 @@ export default function App() {
         // A share link overlays the schema defaults; anything it omits or
         // names wrongly just falls through to the defaults (or a backend 400).
         const shared = fromSearch(window.location.search);
-        const sharedSlug = catalogue.some((s) => s.slug === shared.strategy) ? shared.strategy! : null;
+        const sharedSlug = catalogue.some((s) => s.slug === shared.q.get("strategy")) ? shared.q.get("strategy") : null;
         const defaults = Object.fromEntries(catalogue.map((s) => [s.slug, defaultsOf(s.params)]));
         if (sharedSlug) defaults[sharedSlug] = { ...defaults[sharedSlug], ...shared.params };
 
@@ -515,13 +494,14 @@ export default function App() {
         setConfigSpecs(config);
         setConfigValues({ ...defaultsOf(config), ...shared.config });
         setParamsBySlug(defaults);
-        if (shared.ticker) setTicker(shared.ticker.toUpperCase());
-        if (shared.interval) setInterval(shared.interval);
-        if (shared.period) setPeriod(shared.period);
-        if (shared.start || shared.end) {
+        const [ticker, interval, period, start, end] = ["ticker", "interval", "period", "start", "end"].map((k) => shared.q.get(k));
+        if (ticker) setTicker(ticker.toUpperCase());
+        if (interval) setInterval(interval);
+        if (period) setPeriod(period);
+        if (start || end) {
           setRangeMode("custom");
-          setStart(shared.start ?? "");
-          setEnd(shared.end ?? "");
+          setStart(start ?? "");
+          setEnd(end ?? "");
         }
         setSlug(sharedSlug ?? catalogue[0]?.slug ?? "");
         setLoadingSchema(false);
@@ -779,7 +759,7 @@ export default function App() {
               </>
             ) : (
               <span className="text-sm" style={{ color: "var(--muted-foreground)" }}>
-                Backtest is loading... (takes a while on the first load since I'm using a free Render instance.)
+                {LOADING_NOTE}
               </span>
             )}
           </div>
@@ -821,7 +801,7 @@ export default function App() {
               style={{ background: "var(--card)", borderColor: "var(--border)" }}
             >
               <p className="text-xs" style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}>
-                {running ? "Backtest is loading... (takes a while on the first load since I'm using a free Render instance.)" : "Pick a strategy and run a backtest."}
+                {running ? LOADING_NOTE : "Pick a strategy and run a backtest."}
               </p>
             </div>
           ) : (

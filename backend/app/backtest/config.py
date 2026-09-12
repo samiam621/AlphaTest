@@ -89,15 +89,14 @@ class BacktestConfig:
             raise ValueError(
                 f"initial_capital must be positive, got {self.initial_capital}"
             )
-        for name in ("commission_bps",):
-            value = getattr(self, name)
-            if value < 0:
-                raise ValueError(f"{name} cannot be negative, got {value}")
-            if value > 1_000:  # 10% per side
-                raise ValueError(
-                    f"{name} is {value} bps ({value / 100:.1f}% per side) — that "
-                    f"looks like a percentage entered as basis points"
-                )
+        bps = self.commission_bps
+        if bps < 0:
+            raise ValueError(f"commission_bps cannot be negative, got {bps}")
+        if bps > 1_000:  # 10% per side
+            raise ValueError(
+                f"commission_bps is {bps} bps ({bps / 100:.1f}% per side) — that "
+                f"looks like a percentage entered as basis points"
+            )
         if self.execution not in EXECUTION_MODELS:
             raise ValueError(
                 f"execution must be one of {', '.join(EXECUTION_MODELS)}, "
