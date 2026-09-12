@@ -261,6 +261,24 @@ function Select({
   );
 }
 
+/** Header run picker, coloured to match the run's chart series. */
+function RunSelect({ value, options, onChange }: { value: string; options: string[]; onChange: (v: string) => void }) {
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="px-2 py-1 rounded text-sm outline-none cursor-pointer"
+      style={{ ...FIELD_STYLE, color: SERIES_COLORS[options.indexOf(value)] }}
+    >
+      {options.map((l) => (
+        <option key={l} value={l} style={{ background: "#1a1d35" }}>
+          {l}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 function TextField({
   label,
   value,
@@ -472,6 +490,7 @@ export default function App() {
   // Run state: one result per run label, and which one fills the detail view.
   const [results, setResults] = useState<Record<string, BacktestResponse>>({});
   const [selected, setSelected] = useState("");
+  const [compareTo, setCompareTo] = useState("");
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"nav" | "drawdown" | "monthly">("nav");
@@ -559,6 +578,7 @@ export default function App() {
     });
     setResults(next);
     setSelected((sel) => (next[sel] ? sel : Object.keys(next)[0] ?? ""));
+    setCompareTo((c) => (next[c] ? c : Object.keys(next)[1] ?? Object.keys(next)[0] ?? ""));
     setRunError(errors.length ? errors.join("\n") : null);
     setRunning(false);
   }, []);
@@ -652,19 +672,19 @@ export default function App() {
   const labels = Object.keys(results);
   const result = results[selected];
   const metrics = result?.metrics;
-  const benchmark = metrics?.benchmark;
+  const compare = results[compareTo]?.metrics;
   const trades = result?.trades ?? [];
 
-  // Excess return over buy-and-hold. Not Jensen's alpha — the backend does not
+  // Excess return over the compared run. Not Jensen's alpha — the backend does not
   // compute a beta — so it is labelled for what it is.
   const excess =
-    metrics?.total_return != null && benchmark?.total_return != null
-      ? metrics.total_return - benchmark.total_return
+    metrics?.total_return != null && compare?.total_return != null
+      ? metrics.total_return - compare.total_return
       : null;
 
   // Every run's curve merged by date into one table (`eq_<label>` columns) so
   // they overlay on one chart; runs share initial_equity, so raw dollars are
-  // comparable. Benchmark and drawdown come from the selected run only.
+  // comparable. Drawdown comes from the selected run only.
   // Different tickers trade on different days (BTC-USD has weekends), hence
   // the merge rather than a zip.
   const chartData = useMemo(() => {
@@ -674,7 +694,6 @@ export default function App() {
         const row = byDate.get(p.date) ?? { date: p.date };
         row[`eq_${label}`] = p.equity;
         if (label === selected) {
-          row.benchmark = p.benchmark;
           row.drawdown = p.drawdown == null ? null : p.drawdown * 100;
         }
         byDate.set(p.date, row);
@@ -753,6 +772,11 @@ export default function App() {
                 <SidebarSection title="Universe">
                   {rows.map((r, i) => (
                     <div key={i} className="flex items-end gap-1.5">
+                      {/* Series colour for this row's curve; falls back to row order before the first run. */}
+                      <span
+                        className="w-2 h-2 rounded-full shrink-0 mb-2.5"
+                        style={{ background: SERIES_COLORS[labels.includes(labelOf(r)) ? labels.indexOf(labelOf(r)) : i] }}
+                      />
                       <div className="flex-1">
                         <TextField
                           label={`Ticker ${i + 1}`}
@@ -973,23 +997,12 @@ export default function App() {
             </button>
             {result ? (
               <>
-                {/* One badge per run; clicking picks which fills the detail view. */}
-                {labels.map((label, i) => (
-                  <button
-                    key={label}
-                    onClick={() => setSelected(label)}
-                    className="ticker-badge whitespace-nowrap"
-                    style={{
-                      cursor: "pointer",
-                      opacity: label === selected ? 1 : 0.5,
-                      color: SERIES_COLORS[i],
-                      borderColor: label === selected ? SERIES_COLORS[i] : "var(--border)",
-                      background: "transparent",
-                    }}
-                  >
-                    {label}
-                  </button>
-                ))}
+                {/* A fills the detail view; B is what its metrics are compared against. */}
+                <RunSelect value={selected} options={labels} onChange={setSelected} />
+                <span className="text-xs" style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}>
+                  vs
+                </span>
+                <RunSelect value={compareTo} options={labels} onChange={setCompareTo} />
                 <span className="text-sm font-medium" style={{ color: "var(--foreground)" }}>
                   {result.strategy.name}
                 </span>
@@ -1009,16 +1022,6 @@ export default function App() {
                 {result.count} bars
               </span>
             )}
-            {(labels.length ? labels : ["Strategy"]).map((label, i) => (
-              <div key={label} className="flex items-center gap-1.5 text-xs whitespace-nowrap" style={{ fontFamily: "var(--font-data)", color: SERIES_COLORS[i] }}>
-                <span className="w-2 h-2 rounded-full inline-block" style={{ background: SERIES_COLORS[i] }} />
-                {label}
-              </div>
-            ))}
-            <div className="flex items-center gap-1.5 text-xs whitespace-nowrap" style={{ fontFamily: "var(--font-data)", color: "var(--primary)" }}>
-              <span className="w-2 h-2 rounded-full inline-block" style={{ background: "var(--primary)" }} />
-              Buy &amp; Hold
-            </div>
           </div>
         </header>
 
@@ -1053,10 +1056,9 @@ export default function App() {
                 <MetricCard
                   label="Total Return"
                   value={pct(metrics?.total_return)}
-                  sub={`vs ${pct(benchmark?.total_return)} B&H`}
                   positive={signOf(metrics?.total_return)}
                 />
-                <MetricCard label="Excess vs B&H" value={pct(excess)} positive={signOf(excess)} />
+                <MetricCard label="Excess" value={pct(excess)} sub={`vs ${compareTo}`} positive={signOf(excess)} />
                 <MetricCard
                   label="Sharpe"
                   value={num(metrics?.sharpe)}
@@ -1117,10 +1119,6 @@ export default function App() {
                               <stop offset="95%" stopColor={SERIES_COLORS[i]} stopOpacity={0} />
                             </linearGradient>
                           ))}
-                          <linearGradient id="benchGrad" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%" stopColor="var(--primary)" stopOpacity={0.12} />
-                            <stop offset="95%" stopColor="var(--primary)" stopOpacity={0} />
-                          </linearGradient>
                         </defs>
                         <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false} />
                         <XAxis
@@ -1143,17 +1141,6 @@ export default function App() {
                         {metrics?.initial_equity != null && (
                           <ReferenceLine y={metrics.initial_equity} stroke="rgba(255,255,255,0.1)" strokeDasharray="4 2" />
                         )}
-                        <Area
-                          type="monotone"
-                          dataKey="benchmark"
-                          name="Buy & Hold"
-                          stroke="var(--primary)"
-                          strokeWidth={1.5}
-                          fill="url(#benchGrad)"
-                          dot={false}
-                          activeDot={{ r: 3, fill: "var(--primary)" }}
-                          connectNulls
-                        />
                         {labels.map((label, i) => (
                           <Area
                             key={label}
@@ -1333,12 +1320,12 @@ export default function App() {
                       className="text-[10px] font-semibold tracking-widest uppercase mb-3"
                       style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}
                     >
-                      Buy &amp; Hold Benchmark
+                      Compared: {compareTo}
                     </p>
-                    <StatRow label="Total Return" value={pct(benchmark?.total_return)} tone={toneOf(benchmark?.total_return)} />
-                    <StatRow label="CAGR" value={pct(benchmark?.cagr)} tone={toneOf(benchmark?.cagr)} />
-                    <StatRow label="Max Drawdown" value={pctPlain(benchmark?.max_drawdown)} tone="loss" />
-                    <StatRow label="Sharpe" value={num(benchmark?.sharpe)} tone={toneOf(benchmark?.sharpe)} />
+                    <StatRow label="Total Return" value={pct(compare?.total_return)} tone={toneOf(compare?.total_return)} />
+                    <StatRow label="CAGR" value={pct(compare?.cagr)} tone={toneOf(compare?.cagr)} />
+                    <StatRow label="Max Drawdown" value={pctPlain(compare?.max_drawdown)} tone="loss" />
+                    <StatRow label="Sharpe" value={num(compare?.sharpe)} tone={toneOf(compare?.sharpe)} />
                   </div>
                 </div>
 

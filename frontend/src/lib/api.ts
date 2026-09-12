@@ -41,13 +41,6 @@ export interface TradeStats {
   worst: number | null
 }
 
-export interface BenchmarkMetrics {
-  total_return: number | null
-  cagr: number | null
-  max_drawdown: number | null
-  sharpe: number | null
-}
-
 /** All returns and drawdowns are fractions: 0.125 is +12.5%. */
 export interface Metrics {
   bars: number
@@ -64,7 +57,6 @@ export interface Metrics {
   calmar: number | null
   exposure: number | null
   trades: TradeStats
-  benchmark?: BenchmarkMetrics
   gross_total_return: number | null
   cost_drag: number | null
   turnover: number
@@ -73,7 +65,6 @@ export interface Metrics {
 export interface EquityPoint {
   date: string
   equity: number | null
-  benchmark: number | null
   drawdown: number | null
 }
 
