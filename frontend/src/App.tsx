@@ -466,6 +466,7 @@ export default function App() {
   const [configValues, setConfigValues] = useState<Values>({});
   const [showSettings, setShowSettings] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarWidth, setSidebarWidth] = useState(224);
   const [sidebarTab, setSidebarTab] = useState<"tickers" | "strategy" | "params">("tickers");
 
   // Run state: one result per run label, and which one fills the detail view.
@@ -712,8 +713,8 @@ export default function App() {
       {/* ── Sidebar ── */}
       {sidebarOpen && (
       <aside
-        className="flex flex-col w-56 shrink-0 border-r overflow-y-auto"
-        style={{ background: "#090b18", borderColor: "var(--border)" }}
+        className="flex flex-col shrink-0 border-r overflow-y-auto"
+        style={{ width: sidebarWidth, background: "#090b18", borderColor: "var(--border)" }}
       >
         <div className="flex items-center gap-2.5 px-4 py-4 border-b" style={{ borderColor: "var(--border)" }}>
           <div
@@ -942,6 +943,18 @@ export default function App() {
         )}
       </aside>
       )}
+      {sidebarOpen && (
+        <div
+          className="w-1 shrink-0 cursor-col-resize hover:bg-[var(--primary)]"
+          onPointerDown={(e) => {
+            e.currentTarget.setPointerCapture(e.pointerId);
+            e.preventDefault();
+          }}
+          onPointerMove={(e) => {
+            if (e.buttons & 1) setSidebarWidth(Math.min(600, Math.max(160, e.clientX)));
+          }}
+        />
+      )}
 
       {/* ── Main Panel ── */}
       <main className="flex-1 flex flex-col overflow-hidden">
@@ -1030,7 +1043,7 @@ export default function App() {
               style={{ background: "var(--card)", borderColor: "var(--border)" }}
             >
               <p className="text-xs" style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}>
-                {running ? LOADING_NOTE : "Pick a strategy and run a backtest."}
+                {running ? LOADING_NOTE : "Backtest is loading..."}
               </p>
             </div>
           ) : (
