@@ -36,10 +36,6 @@ class BacktestResult:
     """Everything one run produced. Series stay as pandas for the API to shape."""
 
     equity: pd.Series
-    #: What the same money would have done just holding the asset. Cost-free,
-    #: and always close-to-close from the first bar whatever the execution
-    #: model: it is the "why bother" baseline, not a competing strategy.
-    benchmark_equity: pd.Series
     #: The curve without trading costs — the gap to ``equity`` is the cost drag.
     gross_equity: pd.Series
     position: pd.Series
@@ -111,7 +107,6 @@ def run(
     capital = config.initial_capital
     equity = capital * (1 + net_returns).cumprod()
     gross_equity = capital * (1 + gross_returns).cumprod()
-    benchmark_equity = capital * close / close.iloc[0]
 
     ledger = trades_mod.extract(fills, net_returns, close, config.cost_rate)
 
@@ -124,7 +119,6 @@ def run(
         # The open trade is excluded: its "result" is just wherever the data
         # ended, and counting it would make the win rate depend on the run date.
         trade_returns=trades_mod.returns(ledger),
-        benchmark_equity=benchmark_equity,
     )
 
     gross_total = metrics_mod.total_return(gross_equity)
@@ -140,7 +134,6 @@ def run(
 
     return BacktestResult(
         equity=equity,
-        benchmark_equity=benchmark_equity,
         gross_equity=gross_equity,
         position=position,
         gross_returns=gross_returns,

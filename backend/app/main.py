@@ -130,8 +130,7 @@ def backtest_config_schema():
 def run_backtest(req: BacktestRequest):
     """Run one strategy over one ticker and report how it would have done.
 
-    The response has four parts: ``metrics`` (headline performance, including a
-    buy-and-hold benchmark), ``equity`` (the curve, for charting), ``trades``
+    The response has four parts: ``metrics`` (headline performance), ``equity`` (the curve, for charting), ``trades``
     (the round-trip ledger) and optionally ``bars`` (per-bar indicator values
     and positions).
     """
@@ -165,7 +164,6 @@ def run_backtest(req: BacktestRequest):
         pd.DataFrame(
             {
                 "equity": result.equity,
-                "benchmark": result.benchmark_equity,
                 # Saves the UI recomputing a running maximum to draw the
                 # underwater chart.
                 "drawdown": metrics.drawdown_series(result.equity),

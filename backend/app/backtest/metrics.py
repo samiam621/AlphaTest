@@ -265,7 +265,6 @@ def summarize(
     periods_per_year: float,
     risk_free_rate: float = 0.0,
     trade_returns: Sequence[float] | None = None,
-    benchmark_equity: pd.Series | None = None,
 ) -> dict[str, object]:
     """The full metrics block for an API response. All values JSON-safe."""
     returns = returns_from_equity(equity)
@@ -287,15 +286,4 @@ def summarize(
         "trades": trade_stats(trade_returns or []),
     }
 
-    if benchmark_equity is not None:
-        # Buy and hold over the same window. Without it the strategy's return is
-        # uninterpretable — beating cash and beating the stock are different wins.
-        summary["benchmark"] = {
-            "total_return": total_return(benchmark_equity),
-            "cagr": cagr(benchmark_equity, periods_per_year),
-            "max_drawdown": max_drawdown(benchmark_equity),
-            "sharpe": sharpe(
-                returns_from_equity(benchmark_equity), periods_per_year, risk_free_rate
-            ),
-        }
     return summary

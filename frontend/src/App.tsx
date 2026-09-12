@@ -262,13 +262,13 @@ function Select({
 }
 
 /** Header run picker, coloured to match the run's chart series. */
-function RunSelect({ value, options, onChange }: { value: string; options: string[]; onChange: (v: string) => void }) {
+function RunSelect({ value, options, color, onChange }: { value: string; options: string[]; color: string; onChange: (v: string) => void }) {
   return (
     <select
       value={value}
       onChange={(e) => onChange(e.target.value)}
       className="px-2 py-1 rounded text-sm outline-none cursor-pointer"
-      style={{ ...FIELD_STYLE, color: SERIES_COLORS[options.indexOf(value)] }}
+      style={{ ...FIELD_STYLE, color }}
     >
       {options.map((l) => (
         <option key={l} value={l} style={{ background: "#1a1d35" }}>
@@ -578,7 +578,6 @@ export default function App() {
     });
     setResults(next);
     setSelected((sel) => (next[sel] ? sel : Object.keys(next)[0] ?? ""));
-    setCompareTo((c) => (next[c] ? c : Object.keys(next)[1] ?? Object.keys(next)[0] ?? ""));
     setRunError(errors.length ? errors.join("\n") : null);
     setRunning(false);
   }, []);
@@ -624,11 +623,15 @@ export default function App() {
         setConfigSpecs(config);
         setConfigValues({ ...defaultsOf(config), ...shared.config });
         setParamsBySlug(defaults);
-        const tickers = shared.tickers.length ? shared.tickers.slice(0, MAX_TICKERS) : ["AAPL"];
+        // No link: open on the first strategy against buy-and-hold on the same
+        // ticker, so Excess has something real to be measured against.
+        const [tickers, slugs] = shared.tickers.length
+          ? [shared.tickers.slice(0, MAX_TICKERS), shared.strategies]
+          : [["AAPL", "AAPL"], [first, "buy_and_hold"]];
         setRows(
           tickers.map((t, i) => ({
             ticker: t.toUpperCase(),
-            slug: known(shared.strategies[i]) ? shared.strategies[i] : first,
+            slug: known(slugs[i]) ? slugs[i] : first,
           })),
         );
         const [interval, period, start, end] = ["interval", "period", "start", "end"].map((k) => shared.q.get(k));
@@ -672,8 +675,14 @@ export default function App() {
   const labels = Object.keys(results);
   const result = results[selected];
   const metrics = result?.metrics;
-  const compare = results[compareTo]?.metrics;
   const trades = result?.trades ?? [];
+
+  // A comparison needs two runs, and never the same run on both sides — so the
+  // compared label is derived here rather than trusted from state, which covers
+  // both a single run and the user flipping A to whatever B was.
+  const compareLabel = (compareTo !== selected && results[compareTo] ? compareTo : labels.find((l) => l !== selected)) ?? "";
+  const canCompare = !!compareLabel;
+  const compare = results[compareLabel]?.metrics;
 
   // Excess return over the compared run. Not Jensen's alpha — the backend does not
   // compute a beta — so it is labelled for what it is.
@@ -828,6 +837,11 @@ export default function App() {
                   >
                     {rows.length >= MAX_TICKERS ? `Max ${MAX_TICKERS} tickers` : "+ Add ticker"}
                   </button>
+                  {rows.length < 2 && (
+                    <p className="text-[10px] -mt-2" style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}>
+                      Add a second ticker to compare runs
+                    </p>
+                  )}
 
                   <Select
                     label="Range"
@@ -998,11 +1012,20 @@ export default function App() {
             {result ? (
               <>
                 {/* A fills the detail view; B is what its metrics are compared against. */}
-                <RunSelect value={selected} options={labels} onChange={setSelected} />
-                <span className="text-xs" style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}>
-                  vs
-                </span>
-                <RunSelect value={compareTo} options={labels} onChange={setCompareTo} />
+                <RunSelect value={selected} options={labels} color={SERIES_COLORS[labels.indexOf(selected)]} onChange={setSelected} />
+                {canCompare && (
+                  <>
+                    <span className="text-xs" style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}>
+                      vs
+                    </span>
+                    <RunSelect
+                      value={compareLabel}
+                      options={labels.filter((l) => l !== selected)}
+                      color={SERIES_COLORS[labels.indexOf(compareLabel)]}
+                      onChange={setCompareTo}
+                    />
+                  </>
+                )}
                 <span className="text-sm font-medium" style={{ color: "var(--foreground)" }}>
                   {result.strategy.name}
                 </span>
@@ -1052,13 +1075,15 @@ export default function App() {
           ) : (
             <>
               {/* ── Key Metrics Row ── */}
-              <div className="grid grid-cols-4 gap-2.5 md:grid-cols-8">
+              <div className="grid grid-cols-4 gap-2.5 md:grid-cols-none md:grid-flow-col md:auto-cols-fr">
                 <MetricCard
                   label="Total Return"
                   value={pct(metrics?.total_return)}
                   positive={signOf(metrics?.total_return)}
                 />
-                <MetricCard label="Excess" value={pct(excess)} sub={`vs ${compareTo}`} positive={signOf(excess)} />
+                {canCompare && (
+                  <MetricCard label="Excess" value={pct(excess)} sub={`vs ${compareLabel}`} positive={signOf(excess)} />
+                )}
                 <MetricCard
                   label="Sharpe"
                   value={num(metrics?.sharpe)}
@@ -1315,18 +1340,20 @@ export default function App() {
                     <StatRow label="Final Equity" value={money(metrics?.final_equity)} tone={toneOf(metrics?.total_return)} />
                   </div>
 
-                  <div className="rounded border p-4" style={{ background: "var(--card)", borderColor: "var(--border)" }}>
-                    <p
-                      className="text-[10px] font-semibold tracking-widest uppercase mb-3"
-                      style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}
-                    >
-                      Compared: {compareTo}
-                    </p>
-                    <StatRow label="Total Return" value={pct(compare?.total_return)} tone={toneOf(compare?.total_return)} />
-                    <StatRow label="CAGR" value={pct(compare?.cagr)} tone={toneOf(compare?.cagr)} />
-                    <StatRow label="Max Drawdown" value={pctPlain(compare?.max_drawdown)} tone="loss" />
-                    <StatRow label="Sharpe" value={num(compare?.sharpe)} tone={toneOf(compare?.sharpe)} />
-                  </div>
+                  {canCompare && (
+                    <div className="rounded border p-4" style={{ background: "var(--card)", borderColor: "var(--border)" }}>
+                      <p
+                        className="text-[10px] font-semibold tracking-widest uppercase mb-3"
+                        style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}
+                      >
+                        Compared: {compareLabel}
+                      </p>
+                      <StatRow label="Total Return" value={pct(compare?.total_return)} tone={toneOf(compare?.total_return)} />
+                      <StatRow label="CAGR" value={pct(compare?.cagr)} tone={toneOf(compare?.cagr)} />
+                      <StatRow label="Max Drawdown" value={pctPlain(compare?.max_drawdown)} tone="loss" />
+                      <StatRow label="Sharpe" value={num(compare?.sharpe)} tone={toneOf(compare?.sharpe)} />
+                    </div>
+                  )}
                 </div>
 
                 {/* Trade log */}
