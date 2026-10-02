@@ -1,26 +1,25 @@
 /**
- * Client for the FastAPI backend in `backend/app/main.py`.
+ * Functions for calling the backend API (backend/app/main.py), plus TypeScript
+ * types that match its JSON responses.
  *
- * Every type here mirrors a response that backend actually returns, so a change
- * on the Python side shows up as a type error rather than as `undefined` in a
- * chart. Numbers the backend cannot compute come back as `null` (a flat equity
- * curve has no Sharpe, a strategy that never traded has no win rate) — that is
- * why so many fields below are nullable.
+ * Many fields are `number | null`: the backend sends null when a stat can't be
+ * computed (e.g. no trades -> no win rate).
  */
 
-// Empty by default: requests go to the same origin and Vite proxies /api to
-// uvicorn. Set VITE_API_BASE to point a built bundle at another host.
+// Empty = same server as the page (in dev, Vite forwards /api to the backend).
+// Set VITE_API_BASE when the backend lives on a different host.
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
-/** A single tunable input, read off a strategy's params dataclass. */
+/** One form field (from a Python dataclass, via params.describe). */
 export interface ParamSpec {
   name: string
   type: 'int' | 'float' | 'str' | 'bool'
   default: number | string | boolean
-  /** Present when the field is one of a fixed set — render a dropdown. */
+  /** If present, show a dropdown with these options. */
   choices?: string[]
 }
 
+/** One strategy from GET /api/strategies. */
 export interface StrategyInfo {
   slug: string
   name: string
@@ -28,23 +27,18 @@ export interface StrategyInfo {
   params: ParamSpec[]
 }
 
+/** Per-trade stats (metrics.trade_stats in Python). */
 export interface TradeStats {
   count: number
-  wins: number
-  losses: number
   win_rate: number | null
   avg_win: number | null
   avg_loss: number | null
   avg_trade: number | null
   profit_factor: number | null
-  best: number | null
-  worst: number | null
 }
 
-/** All returns and drawdowns are fractions: 0.125 is +12.5%. */
+/** Headline stats for one run. Returns and drawdowns are fractions: 0.125 = +12.5%. */
 export interface Metrics {
-  bars: number
-  periods_per_year: number
   initial_equity: number | null
   final_equity: number | null
   total_return: number | null
@@ -57,33 +51,30 @@ export interface Metrics {
   calmar: number | null
   exposure: number | null
   trades: TradeStats
-  gross_total_return: number | null
   cost_drag: number | null
   turnover: number
 }
 
+/** One point on the equity curve. drawdown is a fraction <= 0. */
 export interface EquityPoint {
   date: string
   equity: number | null
   drawdown: number | null
 }
 
+/** One trade, buy to sell (trades.Trade in Python). */
 export interface TradeRecord {
   entry_date: string
   exit_date: string
   entry_price: number
   exit_price: number
   direction: 'long' | 'short'
-  size: number
   bars: number
-  gross_return: number
   net_return: number
-  cost_impact: number
-  mfe: number
-  mae: number
   is_open: boolean
 }
 
+/** Response of POST /api/backtest. */
 export interface BacktestResponse {
   ticker: string
   interval: string
@@ -99,6 +90,7 @@ export interface BacktestResponse {
   trades: TradeRecord[]
 }
 
+/** Body sent to POST /api/backtest (BacktestRequest in main.py). */
 export interface BacktestRequest {
   ticker: string
   start?: string | null
@@ -110,10 +102,9 @@ export interface BacktestRequest {
   strategy: string
   params: Record<string, number | string | boolean>
   config: Record<string, number | string | boolean>
-  include_bars?: boolean
 }
 
-/** A failed request, carrying the backend's own explanation where there is one. */
+/** Error thrown when a request fails; message is the backend's error text when there is one. */
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -124,6 +115,7 @@ export class ApiError extends Error {
   }
 }
 
+/** Shared fetch wrapper: sends JSON, parses JSON, turns any failure into an ApiError. */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
@@ -132,7 +124,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       ...init,
     })
   } catch {
-    // No HTTP status at all — the server is down or unreachable.
+    // No response at all: the backend is down or unreachable.
     throw new ApiError(
       'Cannot reach the backend. Is uvicorn running on port 8000?',
       0,
@@ -140,15 +132,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   if (!response.ok) {
-    // FastAPI puts the useful message in `detail`, and HTTPException raised for
-    // a bad ticker or an impossible date range is the common case here.
+    // FastAPI puts the error message in `detail` (e.g. "unknown ticker").
     let detail = `Request failed (${response.status})`
     try {
       const body = await response.json()
       if (typeof body?.detail === 'string') {
         detail = body.detail
       } else if (Array.isArray(body?.detail)) {
-        // Pydantic validation errors arrive as a list of field problems.
+        // Request-shape errors (from Pydantic) come as a list of {loc, msg}.
         detail = body.detail
           .map((e: { loc?: string[]; msg?: string }) =>
             `${e.loc?.slice(1).join('.') ?? 'request'}: ${e.msg ?? 'invalid'}`
@@ -156,7 +147,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
           .join('; ')
       }
     } catch {
-      // Non-JSON error body; the status line above is all we have.
+      // Body wasn't JSON; keep the generic message.
     }
     throw new ApiError(detail, response.status)
   }
@@ -164,18 +155,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
-/** Every strategy and its parameter schema, for building the strategy form. */
+/** GET /api/strategies: every strategy and its settings. Called once on page load. */
 export async function fetchStrategies(): Promise<StrategyInfo[]> {
   const data = await request<{ strategies: StrategyInfo[] }>('/api/strategies')
   return data.strategies
 }
 
-/** Defaults and types for the trading assumptions, for the settings form. */
+/** GET /api/backtest/config: fields for the Execution & Costs form. Called once on page load. */
 export async function fetchConfigSchema(): Promise<ParamSpec[]> {
   const data = await request<{ config: ParamSpec[] }>('/api/backtest/config')
   return data.config
 }
 
+/** POST /api/backtest: run one backtest. Called once per run (duplicate rows are skipped). */
 export function runBacktest(body: BacktestRequest): Promise<BacktestResponse> {
   return request<BacktestResponse>('/api/backtest', {
     method: 'POST',
@@ -183,13 +175,13 @@ export function runBacktest(body: BacktestRequest): Promise<BacktestResponse> {
   })
 }
 
-/** Bar sizes the backend will fetch — `VALID_INTERVALS` in yfinance_source.py. */
+/** Bar sizes the backend accepts. Must match VALID_INTERVALS in yfinance_source.py. */
 export const INTERVALS = [
   '1m', '2m', '5m', '15m', '30m', '60m', '90m', '1h',
   '1d', '5d', '1wk', '1mo', '3mo',
 ] as const
 
-/** Shorthand ranges — `VALID_PERIODS` in yfinance_source.py. */
+/** Preset date ranges. Must match VALID_PERIODS in yfinance_source.py. */
 export const PERIODS = [
   '1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y', '10y', 'ytd', 'max',
 ] as const

@@ -3,7 +3,3 @@ uvicorn
 pandas
 numpy
 yfinance
-requests
-python-dotenv
-
-

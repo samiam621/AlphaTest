@@ -1,3 +1,13 @@
+/**
+ * The whole UI: sidebar form, stat cards, charts and trade log (one React component tree).
+ *
+ * How it works:
+ *   1. Page load: fetch the strategy list + settings fields from the backend,
+ *      build the forms from them, then run a backtest automatically once.
+ *   2. "Run Backtest": buildRequests() makes one request per ticker row, and
+ *      run() sends them all to POST /api/backtest at the same time.
+ *   3. Results are stored by label (e.g. "AAPL") and drive the cards, charts and trade log.
+ */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Area,
@@ -36,21 +46,19 @@ import {
 // ─── Form state ───────────────────────────────────────────────────────────────
 
 /**
- * Every parameter is held as a string, whatever the backend says its type is.
+ * Form values, stored as strings (field name -> text typed).
  *
- * `backend/app/params.py` coerces "14" to 14 and "true" to True on the way in,
- * so keeping the raw text means a half-typed number never has to be forced into
- * a number here — and a field the user clears is simply omitted from the
- * request, which the backend reads as "use the default".
+ * The backend converts "14" -> 14 (params.py), so the UI doesn't have to parse
+ * numbers. An empty field is left out of the request, so the backend uses its default.
  */
 type Values = Record<string, string>;
 
-/** Prefill a form from the schema's own defaults. */
+/** Fill a form with the default values the backend sent. */
 function defaultsOf(specs: ParamSpec[]): Values {
   return Object.fromEntries(specs.map((s) => [s.name, String(s.default)]));
 }
 
-/** Drop cleared fields so the backend falls back to its defaults. */
+/** Remove empty fields so the backend uses its defaults for them. */
 function submitted(values: Values): Record<string, string> {
   return Object.fromEntries(
     Object.entries(values).filter(([, v]) => v.trim() !== ""),
@@ -59,15 +67,15 @@ function submitted(values: Values): Record<string, string> {
 
 // ─── Share links ──────────────────────────────────────────────────────────────
 //
-// A backtest is fully described by its requests, so a share link is just those
-// flattened into the query string: range fields as-is, `tickers` and
-// `strategies` as parallel comma lists, strategy params as `p.<slug>.<name>`,
-// execution config as `c.<name>`. Nothing is stored server-side — the
-// recipient's page rebuilds the form and re-runs.
+// The whole setup is saved in the URL's query string, so opening the link
+// rebuilds the form and re-runs it. Nothing is stored on a server.
+// Format: period/start/end/interval, tickers=AAPL,MSFT, strategies=a,b,
+// p.<strategy>.<param>=value, c.<setting>=value
 
-/** One backtest to run, labelled for the results view. */
+/** One backtest to run: a display label + the request body. */
 type Run = { label: string; body: BacktestRequest };
 
+/** Current setup -> URL query string (for the share link). */
 function toSearch(runs: Run[]): string {
   const q = new URLSearchParams();
   const first = runs[0]?.body;
@@ -82,9 +90,10 @@ function toSearch(runs: Run[]): string {
   return q.toString();
 }
 
+/** URL query string -> form values (the reverse of toSearch). */
 function fromSearch(search: string) {
   const q = new URLSearchParams(search);
-  // Older links carried one `ticker`, one `strategy`, and flat `p.<name>` keys.
+  // Also accepts the older one-ticker link format.
   const tickers = (q.get("tickers") ?? q.get("ticker") ?? "").split(",").filter(Boolean);
   const strategies = (q.get("strategies") ?? q.get("strategy") ?? "").split(",");
   const params: Record<string, Values> = {};
@@ -100,13 +109,12 @@ function fromSearch(search: string) {
 }
 
 const MAX_TICKERS = 5;
-// First entry is the old single-strategy colour, so one ticker looks as before.
+// Line colour for each run, in result order (also used for ticker dots and header pickers).
 const SERIES_COLORS = ["var(--gain)", "#f5a623", "#c084fc", "#38bdf8", "#f472b6"];
 
 /**
- * Thin a curve for the chart: ten years of daily bars is 2500 points, and an
- * SVG path with one node per pixel column looks the same as one with four.
- * The final bar carries the headline return; never let it fall in a gap.
+ * Keep every Nth point (roughly 400-800 total) so the chart draws faster but looks the same.
+ * Always keeps the last point, since that's the final result.
  */
 function thin<T>(points: T[]): T[] {
   const step = Math.max(1, Math.floor(points.length / 400));
@@ -120,14 +128,14 @@ const LOADING_NOTE = "Backtest is loading... ";
 
 const MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-// Suggestions only — the ticker box is free text, because the backend will
-// fetch anything Yahoo knows about.
+// Autocomplete suggestions only; the box accepts any Yahoo ticker.
 const TICKER_SUGGESTIONS = [
-  "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "SPY", "QQQ", "BTC-USD", "^FVX", "^TNX"
+  "AAPL", "NVDA", "TSLA", "AMZN", "GOOGL", "^FVX", "^TNX"
 ];
 
 // ─── Presentational pieces ────────────────────────────────────────────────────
 
+/** Stat card in the top row. Green if positive=true, red if false, default text colour if null. */
 function MetricCard({
   label,
   value,
@@ -172,6 +180,7 @@ function MetricCard({
   );
 }
 
+/** Chart hover box; shows dollars or percent. */
 const CustomTooltip = ({
   active,
   payload,
@@ -212,6 +221,7 @@ const CustomTooltip = ({
   );
 };
 
+// Shared style for inputs and buttons.
 const FIELD_STYLE = {
   background: "var(--secondary)",
   border: "1px solid var(--border)",
@@ -231,54 +241,47 @@ function FieldLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
+/**
+ * Dropdown. With a label it's a sidebar form field; without one it's a compact
+ * header run picker, coloured to match that run's chart line.
+ */
 function Select({
   label,
   value,
   options,
   onChange,
+  color,
 }: {
-  label: string;
+  label?: string;
   value: string;
   options: { value: string; label: string }[];
   onChange: (v: string) => void;
+  color?: string;
 }) {
-  return (
-    <div className="flex flex-col gap-1">
-      <FieldLabel>{label}</FieldLabel>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="px-2 py-1.5 rounded text-sm outline-none cursor-pointer transition-colors"
-        style={FIELD_STYLE}
-      >
-        {options.map((o) => (
-          <option key={o.value} value={o.value} style={{ background: "#1a1d35" }}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-}
-
-/** Header run picker, coloured to match the run's chart series. */
-function RunSelect({ value, options, color, onChange }: { value: string; options: string[]; color: string; onChange: (v: string) => void }) {
-  return (
+  const select = (
     <select
       value={value}
       onChange={(e) => onChange(e.target.value)}
-      className="px-2 py-1 rounded text-sm outline-none cursor-pointer"
-      style={{ ...FIELD_STYLE, color }}
+      className={`px-2 ${label ? "py-1.5" : "py-1"} rounded text-sm outline-none cursor-pointer transition-colors`}
+      style={color ? { ...FIELD_STYLE, color } : FIELD_STYLE}
     >
-      {options.map((l) => (
-        <option key={l} value={l} style={{ background: "#1a1d35" }}>
-          {l}
+      {options.map((o) => (
+        <option key={o.value} value={o.value} style={{ background: "#1a1d35" }}>
+          {o.label}
         </option>
       ))}
     </select>
   );
+  if (!label) return select;
+  return (
+    <div className="flex flex-col gap-1">
+      <FieldLabel>{label}</FieldLabel>
+      {select}
+    </div>
+  );
 }
 
+/** Text / number / date input with a label. */
 function TextField({
   label,
   value,
@@ -314,11 +317,9 @@ function TextField({
 }
 
 /**
- * One input, chosen by what the backend said the field is.
- *
- * The whole point of `/api/strategies` returning a schema is that this is the
- * only place that decides how a parameter looks — adding a parameter to a
- * strategy dataclass in Python makes it appear here with no frontend change.
+ * Draws one backend field (ParamSpec) as the right input:
+ * dropdown for choices/bool, number box for int/float, text box otherwise.
+ * So a new setting added in Python shows up here with no frontend change.
  */
 function SchemaField({
   spec,
@@ -365,6 +366,7 @@ function SchemaField({
   );
 }
 
+/** Titled group of fields in the sidebar. */
 function SidebarSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div>
@@ -383,6 +385,7 @@ function Divider() {
   return <div className="h-px" style={{ background: "var(--border)" }} />;
 }
 
+/** Row of tabs; used in the sidebar and above the charts. */
 function TabBar<T extends string>({
   tabs,
   active,
@@ -418,6 +421,7 @@ function TabBar<T extends string>({
   );
 }
 
+/** "Label ... value" row in the Risk & Costs and Compared panels. */
 function StatRow({
   label,
   value,
@@ -448,12 +452,13 @@ function StatRow({
   );
 }
 
-/** Sign of a value that may be missing, for colouring. `null` means no colour. */
+/** Colour for a value: gain if >= 0, loss if < 0, neutral if missing. */
 function toneOf(value: number | null | undefined): "gain" | "loss" | "neutral" {
   if (value == null || !Number.isFinite(value)) return "neutral";
   return value >= 0 ? "gain" : "loss";
 }
 
+/** For MetricCard: true if above threshold (green), false if not (red), null if missing. */
 function signOf(value: number | null | undefined, threshold = 0): boolean | null {
   if (value == null || !Number.isFinite(value)) return null;
   return value > threshold;
@@ -462,15 +467,15 @@ function signOf(value: number | null | undefined, threshold = 0): boolean | null
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
-  // Schemas, fetched once. Until they arrive there is no form to render, since
-  // the form *is* the schema.
+  // Strategy list + settings fields from the backend. The forms are built from
+  // these, so nothing can show until they load.
   const [strategies, setStrategies] = useState<StrategyInfo[]>([]);
   const [configSpecs, setConfigSpecs] = useState<ParamSpec[]>([]);
   const [schemaError, setSchemaError] = useState<string | null>(null);
   const [loadingSchema, setLoadingSchema] = useState(true);
 
-  // Data selection. Each row pairs a ticker with the strategy that runs on it;
-  // the range and interval are shared by every row.
+  // Ticker rows: each row = a ticker + the strategy to run on it.
+  // Date range and bar size are shared by all rows.
   const [rows, setRows] = useState<{ ticker: string; slug: string; hidden?: boolean }[]>([{ ticker: "AAPL", slug: "" }]);
   const [rangeMode, setRangeMode] = useState<"period" | "custom">("period");
   const [period, setPeriod] = useState("2y");
@@ -478,8 +483,7 @@ export default function App() {
   const [end, setEnd] = useState("");
   const [interval, setInterval] = useState("1d");
 
-  // One set of parameter values per strategy, shared by every ticker running
-  // it, so switching away and back does not lose what was typed.
+  // Param values per strategy (shared by every row using it), kept when switching strategies.
   const [paramsBySlug, setParamsBySlug] = useState<Record<string, Values>>({});
   const [configValues, setConfigValues] = useState<Values>({});
   const [showSettings, setShowSettings] = useState(false);
@@ -487,7 +491,7 @@ export default function App() {
   const [sidebarWidth, setSidebarWidth] = useState(224);
   const [sidebarTab, setSidebarTab] = useState<"tickers" | "strategy" | "params">("tickers");
 
-  // Run state: one result per run label, and which one fills the detail view.
+  // Results by run label. selected = run shown in detail; compareTo = run it's compared against.
   const [results, setResults] = useState<Record<string, BacktestResponse>>({});
   const [selected, setSelected] = useState("");
   const [compareTo, setCompareTo] = useState("");
@@ -497,16 +501,12 @@ export default function App() {
   const [copied, setCopied] = useState(false);
 
   const strategyOf = (slug: string) => strategies.find((s) => s.slug === slug);
-  // Strategies in use, in the order they first appear in the Strategy tab, so
-  // the Params tab reads top-to-bottom the same way.
+  // Strategies in use, in row order (one section each in the Params tab).
   const usedSlugs = [...new Set(rows.map((r) => r.slug).filter(Boolean))];
 
-  // The request builder reads current form state, so it is rebuilt on every
-  // change; `run` below depends on it. This is the one place form state turns
-  // into requests — a pair-trading run would be one more entry here.
   const tickerOf = (r: { ticker: string }) => r.ticker.trim().toUpperCase();
-  // The same ticker under two strategies is a legitimate comparison, so
-  // label it by both. This label keys `results` and the chart series.
+  // Run label: "AAPL", or "AAPL · RSI Threshold" if AAPL is in more than one row.
+  // Used as the key for results and chart lines.
   const labelOf = useCallback(
     (row: { ticker: string; slug: string }) => {
       const t = tickerOf(row);
@@ -515,11 +515,12 @@ export default function App() {
     },
     [rows, strategies],
   );
+  // Runs hidden from the chart with the eye button.
   const hiddenLabels = new Set(rows.filter((r) => r.hidden).map(labelOf));
 
+  // Form state -> one request per ticker row. This is where requests are assembled.
   const buildRequests = useCallback((): Run[] => {
-    // The backend rejects a request carrying both a period and explicit dates,
-    // so the mode toggle decides which pair goes in.
+    // Send either a preset period or start/end dates, never both (backend rejects both).
     const range =
       rangeMode === "period"
         ? { period, start: null, end: null }
@@ -531,7 +532,7 @@ export default function App() {
       const t = tickerOf(row);
       const { slug } = row;
       if (!t || !slug) continue;
-      // Only an exact repeat (same ticker, same strategy) is skipped.
+      // Skip empty rows and exact duplicates (same ticker + same strategy).
       const label = labelOf(row);
       if (seen.has(label)) continue;
       seen.add(label);
@@ -544,18 +545,18 @@ export default function App() {
           strategy: slug,
           params: submitted(paramsBySlug[slug] ?? {}),
           config: submitted(configValues),
-          // The per-bar frame is the largest part of the response and nothing
-          // on this screen reads it.
-          include_bars: false,
         },
       });
     }
     return runs;
   }, [rows, labelOf, rangeMode, period, start, end, interval, paramsBySlug, configValues]);
 
+  // Always points to the latest buildRequests, so run/share can be created
+  // once (empty deps) but still read the current form.
   const requestRef = useRef(buildRequests);
   requestRef.current = buildRequests;
 
+  // Run every row's backtest in parallel and store the results.
   const run = useCallback(async () => {
     const runs = requestRef.current();
     if (!runs.length) {
@@ -565,10 +566,8 @@ export default function App() {
 
     setRunning(true);
     setRunError(null);
-    // One bad ticker should not sink the others, so every run settles and the
-    // failures are listed together. A 400 is almost always the user's input —
-    // an unknown ticker, a start date past the intraday lookback, fast >= slow
-    // — and the backend's message says which, so show it verbatim.
+    // API call happens here. allSettled waits for all of them, so one bad
+    // ticker doesn't cancel the rest; errors are shown together.
     const settled = await Promise.allSettled(runs.map((r) => runBacktest(r.body)));
     const next: Record<string, BacktestResponse> = {};
     const errors: string[] = [];
@@ -577,11 +576,13 @@ export default function App() {
       else errors.push(`${runs[i].label}: ${s.reason instanceof ApiError ? s.reason.message : String(s.reason)}`);
     });
     setResults(next);
+    // Keep the selected run if it still exists, otherwise pick the first.
     setSelected((sel) => (next[sel] ? sel : Object.keys(next)[0] ?? ""));
     setRunError(errors.length ? errors.join("\n") : null);
     setRunning(false);
   }, []);
 
+  // Put the current setup in the URL and copy the link to the clipboard.
   const share = useCallback(async () => {
     const url = `${window.location.origin}${window.location.pathname}?${toSearch(requestRef.current())}`;
     window.history.replaceState(null, "", url);
@@ -590,14 +591,13 @@ export default function App() {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      // Clipboard is blocked (insecure origin, denied permission) — the URL is
-      // already in the address bar, so the user can copy it from there.
+      // Clipboard blocked by the browser; the link is still in the address bar.
       setRunError("Couldn't copy automatically — copy the link from the address bar.");
     }
   }, []);
 
-  // Load both schemas, then run once so the screen opens with real numbers
-  // instead of an empty frame.
+  // On page load: fetch the strategy list + settings fields and fill the form
+  // (defaults, overridden by a share link if there is one).
   useEffect(() => {
     let cancelled = false;
 
@@ -609,8 +609,7 @@ export default function App() {
         ]);
         if (cancelled) return;
 
-        // A share link overlays the schema defaults; anything it omits or
-        // names wrongly just falls through to the defaults (or a backend 400).
+        // Share-link values override the defaults; unknown strategies are ignored.
         const shared = fromSearch(window.location.search);
         const known = (slug: string | undefined) => catalogue.some((s) => s.slug === slug);
         const first = catalogue[0]?.slug ?? "";
@@ -623,8 +622,8 @@ export default function App() {
         setConfigSpecs(config);
         setConfigValues({ ...defaultsOf(config), ...shared.config });
         setParamsBySlug(defaults);
-        // No link: open on the first strategy against buy-and-hold on the same
-        // ticker, so Excess has something real to be measured against.
+        // No share link: AAPL with the first strategy vs AAPL buy-and-hold,
+        // so the Excess card has a baseline to compare against.
         const [tickers, slugs] = shared.tickers.length
           ? [shared.tickers.slice(0, MAX_TICKERS), shared.strategies]
           : [["AAPL", "AAPL"], [first, "buy_and_hold"]];
@@ -655,7 +654,7 @@ export default function App() {
     };
   }, []);
 
-  // Fires exactly once, after the schema load has put real defaults in the form.
+  // Run a backtest automatically once, right after the form is filled.
   const autoRan = useRef(false);
   useEffect(() => {
     if (loadingSchema || schemaError || autoRan.current) return;
@@ -663,6 +662,7 @@ export default function App() {
     void run();
   }, [loadingSchema, schemaError, run]);
 
+  // Small helpers that update one row / one param / one setting (without mutating state).
   const setRow = (i: number, patch: Partial<{ ticker: string; slug: string; hidden?: boolean }>) =>
     setRows((all) => all.map((r, j) => (j === i ? { ...r, ...patch } : r)));
 
@@ -672,30 +672,28 @@ export default function App() {
   const setConfigValue = (name: string, value: string) =>
     setConfigValues((c) => ({ ...c, [name]: value }));
 
+  // Data for the run currently shown.
   const labels = Object.keys(results);
   const result = results[selected];
   const metrics = result?.metrics;
   const trades = result?.trades ?? [];
 
-  // A comparison needs two runs, and never the same run on both sides — so the
-  // compared label is derived here rather than trusted from state, which covers
-  // both a single run and the user flipping A to whatever B was.
+  // Run to compare against: compareTo if it's valid, else any other run.
+  // Never the same run as `selected`.
   const compareLabel = (compareTo !== selected && results[compareTo] ? compareTo : labels.find((l) => l !== selected)) ?? "";
   const canCompare = !!compareLabel;
   const compare = results[compareLabel]?.metrics;
 
-  // Excess return over the compared run. Not Jensen's alpha — the backend does not
-  // compute a beta — so it is labelled for what it is.
+  // Excess = selected run's total return - compared run's total return.
+  // (Not "alpha", which would need beta, a market-risk measure we don't compute.)
   const excess =
     metrics?.total_return != null && compare?.total_return != null
       ? metrics.total_return - compare.total_return
       : null;
 
-  // Every run's curve merged by date into one table (`eq_<label>` columns) so
-  // they overlay on one chart; runs share initial_equity, so raw dollars are
-  // comparable. Drawdown comes from the selected run only.
-  // Different tickers trade on different days (BTC-USD has weekends), hence
-  // the merge rather than a zip.
+  // Combine all runs' equity curves into one row per date ({date, eq_AAPL, eq_MSFT, ...})
+  // so they can be drawn on one chart. Matched by date because tickers can trade
+  // on different days (crypto trades on weekends). Drawdown is from the selected run only.
   const chartData = useMemo(() => {
     const byDate = new Map<string, Record<string, string | number | null>>();
     for (const [label, r] of Object.entries(results)) {
@@ -713,6 +711,7 @@ export default function App() {
       .map((d) => ({ ...byDate.get(d)!, date: day(d) }));
   }, [results, selected]);
 
+  // Monthly returns of the selected run, grouped as {year: {month: return}} for the heatmap.
   const monthly = useMemo(() => (result ? monthlyReturns(result.equity) : []), [result]);
 
   const monthlyByYear = useMemo(() => {
@@ -725,6 +724,7 @@ export default function App() {
 
   const heatmapYears = Object.keys(monthlyByYear).map(Number).sort((a, b) => b - a);
 
+  // Heatmap cell colour: green for gains, red for losses, stronger for bigger moves.
   const colorForReturn = (r: number) => {
     const p = r * 100;
     if (p > 8) return "rgba(0,229,160,0.85)";
@@ -781,7 +781,7 @@ export default function App() {
                 <SidebarSection title="Universe">
                   {rows.map((r, i) => (
                     <div key={i} className="flex items-end gap-1.5">
-                      {/* Series colour for this row's curve; falls back to row order before the first run. */}
+                      {/* Dot in the same colour as this row's chart line. */}
                       <span
                         className="w-2 h-2 rounded-full shrink-0 mb-2.5"
                         style={{ background: SERIES_COLORS[labels.includes(labelOf(r)) ? labels.indexOf(labelOf(r)) : i] }}
@@ -981,6 +981,7 @@ export default function App() {
         )}
       </aside>
       )}
+      {/* Drag handle to resize the sidebar (160-600px). */}
       {sidebarOpen && (
         <div
           className="w-1 shrink-0 cursor-col-resize hover:bg-[var(--primary)]"
@@ -1011,16 +1012,21 @@ export default function App() {
             </button>
             {result ? (
               <>
-                {/* A fills the detail view; B is what its metrics are compared against. */}
-                <RunSelect value={selected} options={labels} color={SERIES_COLORS[labels.indexOf(selected)]} onChange={setSelected} />
+                {/* Left picker = run shown in detail; right picker = run it's compared against. */}
+                <Select
+                  value={selected}
+                  options={labels.map((l) => ({ value: l, label: l }))}
+                  color={SERIES_COLORS[labels.indexOf(selected)]}
+                  onChange={setSelected}
+                />
                 {canCompare && (
                   <>
                     <span className="text-xs" style={{ color: "var(--muted-foreground)", fontFamily: "var(--font-data)" }}>
                       vs
                     </span>
-                    <RunSelect
+                    <Select
                       value={compareLabel}
-                      options={labels.filter((l) => l !== selected)}
+                      options={labels.filter((l) => l !== selected).map((l) => ({ value: l, label: l }))}
                       color={SERIES_COLORS[labels.indexOf(compareLabel)]}
                       onChange={setCompareTo}
                     />
@@ -1263,9 +1269,8 @@ export default function App() {
                           <tbody>
                             {heatmapYears.map((year) => {
                               const yearRets = monthlyByYear[year];
-                              // Compounded, not summed: three +10% months are
-                              // +33.1%, and a summed row would not tie back to
-                              // the equity curve.
+                              // Multiply the months, don't add them: three +10%
+                              // months = +33.1%, not +30%.
                               const yearTotal =
                                 Object.values(yearRets).reduce((acc, r) => acc * (1 + r), 1) - 1;
                               return (

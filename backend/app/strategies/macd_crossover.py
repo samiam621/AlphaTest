@@ -1,14 +1,11 @@
 """MACD crossover — trend following on the gap between two EMAs.
 
-The MACD line is (fast EMA - slow EMA): positive when the short-term average is
-pulling ahead. The signal line is an EMA of that, so it lags it. Long while MACD
-is above its signal line, which is the same as saying the histogram is positive.
+"Trend following" = betting that a move in one direction will keep going.
+MACD = fast EMA - slow EMA; the signal line is an EMA of MACD, so it lags behind.
+Hold while MACD is above its signal line. Reacts sooner than a moving average
+crossover, but gives more false signals in sideways markets.
 
-Compared to a plain moving average crossover this reacts to the *rate* at which
-the averages are separating, so it tends to turn earlier — and to whipsaw more
-in a flat market.
-
-A *state* rule: MACD-above-signal is the position.
+State rule.
 """
 
 from __future__ import annotations
@@ -18,7 +15,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from backend.app.strategies.indicators import macd
-from backend.app.strategies.signal_utils import from_state, require_columns
+from backend.app.strategies.signal_utils import from_state
 
 NAME = "MACD Crossover"
 
@@ -38,11 +35,12 @@ def generate_signals(
     df: pd.DataFrame,
     params: MacdCrossoverParams | None = None,
 ) -> pd.DataFrame:
+    """Return macd / signal_line / hist plus a 0/1 ``signal`` column."""
     params = params or MacdCrossoverParams()
-    require_columns(df, ("close",))
 
     lines = macd(df["close"], params.fast, params.slow, params.signal)
 
+    # Rename MACD's "signal" line so it doesn't clash with our 0/1 "signal" column.
     out = lines.rename(columns={"signal": "signal_line"})
     out["signal"] = from_state(lines["macd"] > lines["signal"])
     return out

@@ -1,17 +1,12 @@
-"""Indicator math.
+"""Technical indicators: formulas traders run on price history (moving averages, RSI, MACD, ...).
 
-Pure functions: prices in, indicator series out. Nothing in here knows about
-positions, entries or exits — that lives in the strategy modules.
-
-Two rules every function follows:
-
-* the result keeps the caller's index, so it lines up with the bars it came from
-* the warm-up period stays NaN instead of being filled with a half-computed
-  value. A 20-day SMA does not exist on day 3, and pretending it does is how a
-  backtest ends up trading on numbers a live system would never have had.
-
-Indicators with more than one output return a DataFrame with named columns
-rather than a tuple, so a strategy can join them straight onto its output.
+Pure math used by the strategy files: prices in, indicator series out.
+Two rules:
+* Output has the same index (dates) as the input, so it lines up with the prices.
+* The first few bars stay NaN until there's enough data ("warm-up"). A 20-bar
+  average doesn't exist on bar 3; filling it in would let the backtest trade
+  on numbers that couldn't exist yet.
+Indicators with several lines return a DataFrame with named columns.
 """
 
 from __future__ import annotations
@@ -21,27 +16,29 @@ import pandas as pd
 
 
 def _window(value: int, name: str) -> int:
-    """Windows are bar counts — reject anything that isn't a positive whole number."""
+    """Check a window length (number of bars) is a positive whole number."""
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
         raise ValueError(f"{name} must be a positive whole number of bars, got {value!r}")
     return int(value)
 
 
 def sma(series: pd.Series, window: int) -> pd.Series:
-    """simple moving average"""
+    """Simple moving average: plain average of the last ``window`` values."""
     window = _window(window, "window")
     return series.rolling(window=window, min_periods=window).mean()
 
 
 def ema(series: pd.Series, span: int) -> pd.Series:
-    """exponential moving average with the standard 2/(span+1) smoothing.
-    """
+    """Exponential moving average: like SMA but recent bars count more (weight 2/(span+1))."""
     span = _window(span, "span")
     return series.ewm(span=span, adjust=False, min_periods=span).mean()
 
 
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    """Relative Strength Index, 0-100, using Wilder's smoothing.
+    """RSI (Relative Strength Index), 0-100: compares average gains to average losses.
+
+    Above 70 = "overbought" (rose a lot), below 30 = "oversold" (fell a lot).
+    Uses Wilder's smoothing, a type of exponential average.
     """
     period = _window(period, "period")
 
@@ -54,8 +51,8 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
 
     out = 100 - (100 / (1 + avg_gain / avg_loss))
 
-    # A stretch with no down bars divides by zero. Textbook RSI is 100 there
-    # (pure gains), and 50 — neutral — if the price simply never moved.
+    # No losses = divide by zero. Standard answer: 100 if it only went up,
+    # 50 (neutral) if the price never moved.
     out = out.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
     out = out.mask((avg_loss == 0) & (avg_gain == 0), 50.0)
     return out
@@ -67,7 +64,7 @@ def macd(
     slow: int = 26,
     signal: int = 9,
 ) -> pd.DataFrame:
-    """MACD line, its signal line, and the histogram between them.
+    """MACD: fast EMA - slow EMA, plus a "signal" line (EMA of MACD) and their gap ("hist").
 
     Columns: ``macd``, ``signal``, ``hist``.
     """
@@ -89,28 +86,25 @@ def bollinger_bands(
     window: int = 20,
     num_std: float = 2.0,
 ) -> pd.DataFrame:
-    """Moving average with bands ``num_std`` standard deviations either side.
+    """Bollinger Bands: a moving average with bands ``num_std`` standard deviations above and below.
 
-    Columns: ``lower``, ``mid``, ``upper``.
+    Bands widen when prices are jumpy, narrow when calm. Columns: ``lower``, ``mid``, ``upper``.
     """
     window = _window(window, "window")
     if num_std <= 0:
         raise ValueError(f"num_std must be positive, got {num_std!r}")
 
     mid = sma(close, window)
-    # ddof=0 (population) is what Bollinger defined and what charts draw;
-    # pandas defaults to ddof=1, which would give slightly wider bands.
+    # ddof=0 (population std dev) is the standard Bollinger definition.
     spread = close.rolling(window=window, min_periods=window).std(ddof=0) * num_std
     return pd.DataFrame({"lower": mid - spread, "mid": mid, "upper": mid + spread})
 
 
 def donchian_channel(high: pd.Series, low: pd.Series, window: int = 20) -> pd.DataFrame:
-    """Highest high and lowest low of the last ``window`` bars.
+    """Donchian Channel: highest high and lowest low of the last ``window`` bars.
 
-    Columns: ``lower``, ``mid``, ``upper``. The window *includes* the current
-    bar, which is what you want to plot. A breakout rule must compare against
-    the channel as it stood before the current bar — see the shift in
-    ``donchian_channel_breakout``.
+    Columns: ``lower``, ``mid``, ``upper``. Includes the current bar, so the
+    breakout strategy shifts it back one bar before comparing.
     """
     window = _window(window, "window")
     upper = high.rolling(window=window, min_periods=window).max()
@@ -119,7 +113,7 @@ def donchian_channel(high: pd.Series, low: pd.Series, window: int = 20) -> pd.Da
 
 
 def roc(close: pd.Series, period: int = 12) -> pd.Series:
-    """Rate of change over ``period`` bars, in percent."""
+    """Rate of change: % price change compared to ``period`` bars ago."""
     period = _window(period, "period")
     return 100 * (close / close.shift(period) - 1)
 
@@ -132,10 +126,10 @@ def stochastic_oscillator(
     smooth_k: int = 3,
     d_period: int = 3,
 ) -> pd.DataFrame:
-    """Where the close sits inside the recent high-low range, 0-100.
+    """Stochastic oscillator, 0-100: where the close sits between the recent low (0) and high (100).
 
-    Columns: ``k`` (smoothed %K) and ``d`` (its moving average). The default
-    ``smooth_k=3`` gives the "slow" stochastic; pass ``smooth_k=1`` for fast.
+    Columns: ``k`` (smoothed %K) and ``d`` (moving average of %K).
+    smooth_k=3 is the common "slow" version; smooth_k=1 is the raw "fast" one.
     """
     k_period = _window(k_period, "k_period")
     smooth_k = _window(smooth_k, "smooth_k")
@@ -146,8 +140,7 @@ def stochastic_oscillator(
     span = highest - lowest
 
     raw_k = 100 * (close - lowest) / span
-    # A perfectly flat window has no range to be positioned in; call it neutral
-    # instead of letting the divide-by-zero through as inf.
+    # Flat range (high == low) would divide by zero; call it 50 (neutral).
     raw_k = raw_k.mask(span == 0, 50.0)
 
     k = raw_k.rolling(window=smooth_k, min_periods=smooth_k).mean()

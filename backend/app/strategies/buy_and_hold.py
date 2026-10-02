@@ -1,6 +1,9 @@
 
 
-"""Buy the asset and stay invested for the full backtest window."""
+"""Buy the asset and stay invested for the full backtest window.
+
+Baseline: on first load the UI compares the other strategy against this in the "Excess" card.
+"""
 
 from __future__ import annotations
 
@@ -8,22 +11,19 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from backend.app.strategies.signal_utils import require_columns
-
 NAME = "Buy and Hold"
 
 
 @dataclass(frozen=True)
 class BuyAndHoldParams:
-	"""no params"""
+	"""No settings."""
 
 
 def generate_signals(
 	df: pd.DataFrame,
 	params: BuyAndHoldParams | None = None,
 ) -> pd.DataFrame:
-	"""Return a long signal for every bar in the input data."""
-	require_columns(df, ("close",))
+	"""Signal = 1 (hold) on every bar."""
 	return pd.DataFrame(
 		{"signal": pd.Series(1, index=df.index, dtype=int)},
 		index=df.index,

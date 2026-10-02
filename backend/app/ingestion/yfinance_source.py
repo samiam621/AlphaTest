@@ -1,42 +1,43 @@
-"""Price data ingestion from Yahoo Finance.
+"""Downloads price data from Yahoo Finance (via the yfinance library).
 
-User selects one of the rule-based strategies and sets its parameters — ticker, date range, and
-strategy-specific inputs 
-
-This handles the ticker, the date range and the bar size. 
-Strategy-specific inputs are handled by the strategy layer
-
+Called by main.py: get_yf_data() fetches the bars, to_records() turns them into JSON.
+Checks the ticker, dates and bar size first, so a bad request gets a clear
+error message instead of an empty chart.
 """
 
 import math
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import yfinance as yf
 
-# Bar sizes Yahoo will serve, mapped to how far back that bar size is available.
-# None means "full history". Anything intraday is capped by Yahoo, so we check
-# the user's date range against these before spending a request.
-INTERVAL_MAX_LOOKBACK = {
-    "1m": timedelta(days=30),
-    "2m": timedelta(days=60),
-    "5m": timedelta(days=60),
-    "15m": timedelta(days=60),
-    "30m": timedelta(days=60),
-    "60m": timedelta(days=730),
-    "90m": timedelta(days=60),
-    "1h": timedelta(days=730),
-    "1d": None,
-    "5d": None,
-    "1wk": None,
-    "1mo": None,
-    "3mo": None,
+# A US trading year: 252 days of 390-minute sessions (09:30-16:00).
+TRADING_DAYS_PER_YEAR = 252
+SESSION_MINUTES = 390
+MINUTES_PER_YEAR = TRADING_DAYS_PER_YEAR * SESSION_MINUTES
+
+# Every allowed bar size -> (how far back Yahoo keeps it, bars per year).
+# Lookback None = all history; Yahoo only keeps minute/hour bars for a limited time.
+# Bars per year turns per-bar stats into yearly ones (see backtest/config.py).
+INTERVALS: dict[str, tuple[timedelta | None, float]] = {
+    "1m": (timedelta(days=30), MINUTES_PER_YEAR),
+    "2m": (timedelta(days=60), MINUTES_PER_YEAR / 2),
+    "5m": (timedelta(days=60), MINUTES_PER_YEAR / 5),
+    "15m": (timedelta(days=60), MINUTES_PER_YEAR / 15),
+    "30m": (timedelta(days=60), MINUTES_PER_YEAR / 30),
+    "60m": (timedelta(days=730), MINUTES_PER_YEAR / 60),
+    "90m": (timedelta(days=60), MINUTES_PER_YEAR / 90),
+    "1h": (timedelta(days=730), MINUTES_PER_YEAR / 60),
+    "1d": (None, TRADING_DAYS_PER_YEAR),
+    "5d": (None, TRADING_DAYS_PER_YEAR / 5),
+    "1wk": (None, 52.0),
+    "1mo": (None, 12.0),
+    "3mo": (None, 4.0),
 }
 
-VALID_INTERVALS = tuple(INTERVAL_MAX_LOOKBACK)
+VALID_INTERVALS = tuple(INTERVALS)
 
-# Shorthand ranges the user can pick instead of typing two dates.
+# Preset date ranges the user can pick instead of typing start/end dates.
 VALID_PERIODS = (
     "1d", "5d", "1mo", "3mo", "6mo",
     "1y", "2y", "5y", "10y", "ytd", "max",
@@ -45,27 +46,8 @@ VALID_PERIODS = (
 OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 
 
-@dataclass(frozen=True)
-class PriceRequest:
-    """The data-selection parameters a user sets in the UI.
-
-    Either give ``start``/``end``, or give ``period``. If neither is set the
-    fetch defaults to one year of daily bars.
-    """
-
-    ticker: str
-    start: date | str | None = None
-    end: date | str | None = None
-    period: str | None = None
-    interval: str = "1d"
-    # Split/dividend adjusted bars — what you almost always want to backtest on.
-    auto_adjust: bool = True
-    # Include pre/post market bars (intraday intervals only).
-    prepost: bool = False
-
-
 def _coerce_date(value: date | str | None, field: str) -> date | None:
-    """Accept an ISO string or a date/datetime from the request body."""
+    """Parse a 'YYYY-MM-DD' string into a date (dates pass straight through)."""
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -78,28 +60,34 @@ def _coerce_date(value: date | str | None, field: str) -> date | None:
         raise ValueError(f"{field} must be a YYYY-MM-DD date, got {value!r}")
 
 
-def _validate(req: PriceRequest) -> tuple[date | None, date | None]:
-    """Check the user's parameters before hitting the network."""
-    if not req.ticker or not req.ticker.strip():
+def _validate(
+    ticker: str,
+    start: date | str | None,
+    end: date | str | None,
+    period: str | None,
+    interval: str,
+) -> tuple[date | None, date | None]:
+    """Check the request before calling Yahoo. Returns start/end as dates; raises ValueError if invalid."""
+    if not ticker or not ticker.strip():
         raise ValueError("ticker is required")
 
-    if req.interval not in INTERVAL_MAX_LOOKBACK:
+    if interval not in INTERVALS:
         raise ValueError(
-            f"interval {req.interval!r} is not supported; "
+            f"interval {interval!r} is not supported; "
             f"pick one of {', '.join(VALID_INTERVALS)}"
         )
 
-    if req.period is not None and req.period not in VALID_PERIODS:
+    if period is not None and period not in VALID_PERIODS:
         raise ValueError(
-            f"period {req.period!r} is not supported; "
+            f"period {period!r} is not supported; "
             f"pick one of {', '.join(VALID_PERIODS)}"
         )
 
-    if req.period is not None and (req.start is not None or req.end is not None):
+    if period is not None and (start is not None or end is not None):
         raise ValueError("set either period or start/end, not both")
 
-    start = _coerce_date(req.start, "start")
-    end = _coerce_date(req.end, "end")
+    start = _coerce_date(start, "start")
+    end = _coerce_date(end, "end")
 
     if start is not None and end is not None and start >= end:
         raise ValueError(f"start ({start}) must be before end ({end})")
@@ -108,14 +96,13 @@ def _validate(req: PriceRequest) -> tuple[date | None, date | None]:
     if start is not None and start > today:
         raise ValueError(f"start ({start}) is in the future")
 
-    # Yahoo only keeps intraday bars for a limited window, so a user asking for
-    # 1-minute bars from 2015 gets told why instead of an empty chart.
-    max_lookback = INTERVAL_MAX_LOOKBACK[req.interval]
+    # e.g. 1-minute bars from 2015 don't exist on Yahoo; say so instead of returning nothing.
+    max_lookback = INTERVALS[interval][0]
     if max_lookback is not None and start is not None:
         earliest = today - max_lookback
         if start < earliest:
             raise ValueError(
-                f"{req.interval} bars only go back to {earliest} "
+                f"{interval} bars only go back to {earliest} "
                 f"({max_lookback.days} days); requested start was {start}. "
                 f"Use a later start date or a larger interval."
             )
@@ -132,44 +119,32 @@ def get_yf_data(
     auto_adjust: bool = True,
     prepost: bool = False,
 ) -> pd.DataFrame:
-    """Fetch OHLCV bars for the parameters the user set.
+    """Validate -> download from Yahoo -> clean up. Returns one row per bar.
+
+    Give start/end OR period; if neither, the last 1 year.
+    auto_adjust: prices adjusted for stock splits and dividends (what you want for backtests).
+    prepost: include pre/after-market bars (only for minute/hour bars).
     """
-    return fetch(
-        PriceRequest(
-            ticker=ticker,
-            start=start,
-            end=end,
-            period=period,
-            interval=interval,
-            auto_adjust=auto_adjust,
-            prepost=prepost,
-        )
-    )
-
-
-def fetch(req: PriceRequest) -> pd.DataFrame:
-    """Same as :func:`get_yf_data`, but takes an already-built request."""
-    start, end = _validate(req)
-    symbol = req.ticker.strip().upper()
+    start, end = _validate(ticker, start, end, period, interval)
+    symbol = ticker.strip().upper()
 
     params = {
-        "interval": req.interval,
-        "auto_adjust": req.auto_adjust,
-        "prepost": req.prepost,
-        # Dividends/splits come back as extra columns we drop below.
+        "interval": interval,
+        "auto_adjust": auto_adjust,
+        "prepost": prepost,
+        # Don't return dividend/split columns.
         "actions": False,
         "raise_errors": True,
     }
 
-    if req.period is not None:
-        params["period"] = req.period
+    if period is not None:
+        params["period"] = period
     elif start is None and end is None:
-        # 1yr default backtest window.
+        # No range given: default to the last 1 year.
         params["period"] = "1y"
     else:
         params["start"] = start
-        # yfinance treats end as exclusive, so bump it to include the user's
-        # last day.
+        # yfinance excludes the end date, so add a day to include it.
         params["end"] = end + timedelta(days=1) if end is not None else None
 
     try:
@@ -179,7 +154,7 @@ def fetch(req: PriceRequest) -> pd.DataFrame:
 
     if history is None or history.empty:
         raise ValueError(
-            f"no {req.interval} data for {symbol} in the requested range — "
+            f"no {interval} data for {symbol} in the requested range — "
             f"check the ticker symbol and the dates"
         )
 
@@ -187,7 +162,7 @@ def fetch(req: PriceRequest) -> pd.DataFrame:
 
 
 def _normalize(history: pd.DataFrame) -> pd.DataFrame:
-    """Lowercase the columns, keep OHLCV, drop rows with no price."""
+    """Lowercase column names, keep only OHLCV, drop rows with no price, sort by date."""
     df = history.rename(columns=str.lower)
     df = df[[c for c in OHLCV_COLUMNS if c in df.columns]].copy()
     df.index.name = "date"
@@ -196,11 +171,8 @@ def _normalize(history: pd.DataFrame) -> pd.DataFrame:
 
 
 def to_records(df: pd.DataFrame) -> list[dict]:
-    """JSON-serialisable rows for the API response.
-
-    NaN is replaced with None. JSON has no NaN literal, so json.dumps would emit
-    a bare ``NaN`` token that the browser's JSON.parse rejects — and once
-    indicator columns are joined on, every warm-up period is full of them.
+    """DataFrame -> list of dicts for JSON. NaN becomes None, because JSON has no NaN
+    and the browser would reject the response.
     """
     out = df.reset_index()
     out["date"] = out["date"].apply(lambda ts: ts.isoformat())

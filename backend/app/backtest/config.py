@@ -1,7 +1,8 @@
-"""Backtest settings, and the bar-size arithmetic that annualising depends on.
+"""Backtest settings (BacktestConfig) and how many bars make up one year.
 
-Nothing here touches prices. It holds the knobs a user turns before a run, plus
-the interval -> bars-per-year table that every annualised metric needs.
+The bars-per-year number turns per-bar stats into yearly ones ("annualising"),
+e.g. daily volatility -> yearly volatility. It comes from INTERVALS in yfinance_source.py.
+Used by main.py (build_config, describe_config) and engine.py (periods_per_year).
 """
 
 from __future__ import annotations
@@ -10,78 +11,38 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from backend.app import params as params_mod
-from backend.app.ingestion.yfinance_source import VALID_INTERVALS
+from backend.app.ingestion.yfinance_source import INTERVALS
 
-# Trading days in a year, and the length of a regular US equity session. Every
-# intraday figure below is derived from these two rather than written out, so
-# the relationship between them stays visible.
-TRADING_DAYS_PER_YEAR = 252
-SESSION_MINUTES = 390  # 09:30-16:00
-
-#: How many bars of a given size a year contains. Sharpe, volatility and CAGR
-#: are all "per year" numbers, and getting this wrong silently scales them by a
-#: constant — a 1-hour Sharpe annualised at 252 is off by a factor of ~2.5.
-PERIODS_PER_YEAR: dict[str, float] = {
-    "1m": TRADING_DAYS_PER_YEAR * SESSION_MINUTES,
-    "2m": TRADING_DAYS_PER_YEAR * SESSION_MINUTES / 2,
-    "5m": TRADING_DAYS_PER_YEAR * SESSION_MINUTES / 5,
-    "15m": TRADING_DAYS_PER_YEAR * SESSION_MINUTES / 15,
-    "30m": TRADING_DAYS_PER_YEAR * SESSION_MINUTES / 30,
-    "60m": TRADING_DAYS_PER_YEAR * SESSION_MINUTES / 60,
-    "90m": TRADING_DAYS_PER_YEAR * SESSION_MINUTES / 90,
-    "1h": TRADING_DAYS_PER_YEAR * SESSION_MINUTES / 60,
-    "1d": TRADING_DAYS_PER_YEAR,
-    "5d": TRADING_DAYS_PER_YEAR / 5,
-    "1wk": 52.0,
-    "1mo": 12.0,
-    "3mo": 4.0,
-}
-
-# The two tables have to agree: an interval the user can fetch but not annualise
-# would fail at request time instead of here. Fail at import instead.
-_missing = set(VALID_INTERVALS) - set(PERIODS_PER_YEAR)
-if _missing:
-    raise RuntimeError(
-        f"PERIODS_PER_YEAR is missing interval(s) {sorted(_missing)} that "
-        f"yfinance_source will happily fetch"
-    )
-
+# See execution.py.
 EXECUTION_MODELS = ("close", "next_open")
 
 
 def periods_per_year(interval: str) -> float:
-    """Bars per year for a bar size, for annualising returns and volatility.
-
-    Intraday figures assume a regular session — ``prepost=True`` bars are more
-    numerous than this says, which slightly overstates annualised numbers.
-    """
+    """Bars per year for a bar size. Assumes regular market hours only."""
     try:
-        return PERIODS_PER_YEAR[interval]
+        return INTERVALS[interval][1]
     except KeyError:
         raise ValueError(
             f"cannot annualise {interval!r} bars; known intervals are "
-            f"{', '.join(PERIODS_PER_YEAR)}"
+            f"{', '.join(INTERVALS)}"
         ) from None
 
 
 @dataclass(frozen=True)
 class BacktestConfig:
-    """What the user sets before a run — capital, costs, and fill assumptions."""
+    """Settings the user picks before a run: starting money, fees, when trades fill, risk-free rate."""
 
     initial_capital: float = 10_000.0
 
-    # Per side, in basis points (1 bp = 0.01%). A round trip pays commission
-    # when getting in and out.
+    # Trading fee per buy or sell, in basis points (1 bp = 0.01%).
     commission_bps: float = 0.0
 
-    # "close"     — fill at the close of the bar that produced the signal.
-    #               Standard, and slightly optimistic: you are trading at a
-    #               price you only knew once the bar was over.
-    # "next_open" — fill at the next bar's open. More honest about what was
-    #               actually reachable.
+    # "close":     trade at the closing price of the bar that gave the signal (common, a bit optimistic).
+    # "next_open": trade at the next bar's opening price (more realistic). See execution.py.
     execution: str = field(default="close", metadata={"choices": EXECUTION_MODELS})
 
-    # risk_free_rate of U.S 10 year treasury as default
+    # Yearly return of a "safe" investment, as a decimal (~US 10-year Treasury).
+    # Sharpe/Sortino measure how much the strategy beats this.
     risk_free_rate: float = 0.04841
 
     def __post_init__(self) -> None:
@@ -92,7 +53,7 @@ class BacktestConfig:
         bps = self.commission_bps
         if bps < 0:
             raise ValueError(f"commission_bps cannot be negative, got {bps}")
-        if bps > 1_000:  # 10% per side
+        if bps > 1_000:  # 10% per side: almost certainly a % typed as bps
             raise ValueError(
                 f"commission_bps is {bps} bps ({bps / 100:.1f}% per side) — that "
                 f"looks like a percentage entered as basis points"
@@ -102,7 +63,7 @@ class BacktestConfig:
                 f"execution must be one of {', '.join(EXECUTION_MODELS)}, "
                 f"got {self.execution!r}"
             )
-        # 0.04 is 4%; 4 would be 400% and is almost certainly a unit mix-up.
+        # Must be a decimal: 0.04 = 4%. A value like 4 is a unit mix-up.
         if not -1 < self.risk_free_rate < 1:
             raise ValueError(
                 f"risk_free_rate is a decimal, not a percentage — got "
@@ -111,19 +72,15 @@ class BacktestConfig:
 
     @property
     def cost_rate(self) -> float:
-        """Cost of one side of a trade, as a fraction of the traded value."""
+        """Fee per buy or sell as a fraction (e.g. 10 bps -> 0.001). Used by engine and trades."""
         return self.commission_bps / 10_000
 
 
 def build_config(values: Mapping[str, Any] | None = None) -> BacktestConfig:
-    """Build a config from partial user input, the way strategy params are built.
-
-    Unknown keys are rejected and values are coerced before ``__post_init__``
-    gets to enforce the ranges.
-    """
+    """Request JSON -> validated BacktestConfig (same rules as strategy params)."""
     return params_mod.build(BacktestConfig, values, "config")
 
 
 def describe_config() -> list[dict[str, Any]]:
-    """The config schema, so a UI can render the settings form from one source."""
+    """BacktestConfig schema for the UI's settings form."""
     return params_mod.describe(BacktestConfig)

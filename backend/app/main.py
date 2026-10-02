@@ -1,24 +1,34 @@
+"""FastAPI entry point: the HTTP layer between the React UI and the backtester.
+
+Flow of POST /api/backtest (the main endpoint):
+    registry.get(slug)          find the strategy by name          strategies/registry.py
+    get_yf_data(...)            download price bars from Yahoo     ingestion/yfinance_source.py
+    strategy.run(df, params)    indicators -> buy/sell signal      strategies/*.py
+    build_config(config)        money, fees, fill settings         backtest/config.py
+    engine.run(df, signal, ...) simulate -> equity, trades, stats  backtest/engine.py
+    -> JSON response
+
+A "bar" = one row of price data (open, high, low, close, volume) for one time
+step, e.g. one day. OHLCV is short for those five columns.
+"""
+
 import os
 from dataclasses import asdict
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from backend.app.backtest import engine, metrics, trades as trades_mod
 from backend.app.backtest.config import build_config, describe_config
-from backend.app.ingestion.yfinance_source import (
-    VALID_INTERVALS,
-    VALID_PERIODS,
-    get_yf_data,
-    to_records,
-)
+from backend.app.ingestion.yfinance_source import get_yf_data, to_records
 from backend.app.strategies import registry
 
 app = FastAPI(title="AlphaTest")
 
-# No trailing slashes
+# Browser origins allowed to call this API (CORS): the local Vite dev server,
+# plus any listed in the CORS_ORIGINS env var (comma-separated, no trailing slash).
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -43,61 +53,18 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health():
-    """Liveness probe for the host's health check, and a cheap keep-warm ping."""
+    """Health check that Render pings (healthCheckPath in render.yaml)."""
     return {"status": "ok"}
-
-
-@app.get("/api/data")
-def get_data(
-    ticker: str = Query(..., description="Symbol to backtest, e.g. AAPL"),
-    start: str | None = Query(None, description="Start date, YYYY-MM-DD"),
-    end: str | None = Query(None, description="End date (inclusive), YYYY-MM-DD"),
-    period: str | None = Query(
-        None, description=f"Shorthand range instead of start/end: {', '.join(VALID_PERIODS)}"
-    ),
-    interval: str = Query("1d", description=f"Bar size: {', '.join(VALID_INTERVALS)}"),
-    auto_adjust: bool = Query(True, description="Split/dividend adjusted prices"),
-    prepost: bool = Query(False, description="Include pre/post market bars"),
-):
-    """OHLCV bars for the parameters the user picked in the UI."""
-    try:
-        df = get_yf_data(
-            ticker=ticker,
-            start=start,
-            end=end,
-            period=period,
-            interval=interval,
-            auto_adjust=auto_adjust,
-            prepost=prepost,
-        )
-    except ValueError as exc:
-        # Bad ticker, bad dates, unsupported interval — the user's input, not our bug.
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    bars = to_records(df)
-    return {
-        "ticker": ticker.strip().upper(),
-        "interval": interval,
-        "start": bars[0]["date"],
-        "end": bars[-1]["date"],
-        "count": len(bars),
-        "bars": bars,
-    }
 
 
 @app.get("/api/strategies")
 def list_strategies():
-    """Every strategy and its parameter schema.
-
-    The UI calls this once to build its strategy picker and the parameter form
-    that goes with it, so the form's fields and defaults come from the strategy
-    dataclasses rather than being duplicated in the frontend.
-    """
+    """Every strategy and its param schema. The UI builds its strategy picker and form from this."""
     return {"strategies": registry.catalogue()}
 
 
 class BacktestRequest(BaseModel):
-    """A strategy run: data selection, the rule, and the trading assumptions."""
+    """Body of POST /api/backtest: which data, which strategy, and the trading settings."""
 
     ticker: str
     start: str | None = None
@@ -108,38 +75,29 @@ class BacktestRequest(BaseModel):
     prepost: bool = False
 
     strategy: str = Field(..., description=f"One of: {', '.join(registry.SLUGS)}")
-    # Whatever the user changed from the defaults. Anything left out keeps the
-    # strategy's own default, so the frontend can send only the edited fields.
+    # Only the params the user changed; anything missing uses the strategy's default.
     params: dict = Field(default_factory=dict)
-    # Capital and cost assumptions; same partial-override rules as params.
+    # Same idea for BacktestConfig (capital, commission, execution, risk-free rate).
     config: dict = Field(default_factory=dict)
-
-    # The bar-by-bar frame is the largest part of the response by far and the
-    # metrics view does not need it. Ten years of hourly bars with indicator
-    # columns runs to megabytes.
-    include_bars: bool = True
 
 
 @app.get("/api/backtest/config")
 def backtest_config_schema():
-    """Defaults and types for the trading assumptions, for the settings form."""
+    """BacktestConfig fields and defaults, so the UI can render the settings form."""
     return {"config": describe_config()}
 
 
 @app.post("/api/backtest")
 def run_backtest(req: BacktestRequest):
-    """Run one strategy over one ticker and report how it would have done.
+    """Run one strategy on one ticker. This is the endpoint the UI calls for each run.
 
-    The response has four parts: ``metrics`` (headline performance), ``equity`` (the curve, for charting), ``trades``
-    (the round-trip ledger) and optionally ``bars`` (per-bar indicator values
-    and positions).
+    Returns ``metrics`` (headline stats), ``equity`` (curve + drawdown, for charts)
+    and ``trades`` (one row per trade, for the Trade Log).
     """
     try:
+        # Unknown strategy, bad ticker/dates, bad param names or types, and rule
+        # violations (e.g. fast >= slow) all raise ValueError -> 400 with a readable message.
         strategy = registry.get(req.strategy)
-    except registry.UnknownStrategyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    try:
         df = get_yf_data(
             ticker=req.ticker,
             start=req.start,
@@ -149,35 +107,31 @@ def run_backtest(req: BacktestRequest):
             auto_adjust=req.auto_adjust,
             prepost=req.prepost,
         )
-        # Bad parameter names, un-coercible values, and the dataclasses' own
-        # rules (fast < slow, thresholds in order) all surface as ValueError.
         signals, params = strategy.run(df, req.params)
         config = build_config(req.config)
         result = engine.run(df, signals["signal"], config, interval=req.interval)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except NotImplementedError as exc:
-        # A valid request for something not built yet — not the user's mistake.
+        # Valid request for something not supported yet -> 501.
         raise HTTPException(status_code=501, detail=str(exc)) from exc
 
     curve = to_records(
         pd.DataFrame(
             {
                 "equity": result.equity,
-                # Saves the UI recomputing a running maximum to draw the
-                # underwater chart.
+                # Precomputed so the UI can draw the drawdown chart directly.
                 "drawdown": metrics.drawdown_series(result.equity),
             }
         )
     )
 
-    response = {
+    return {
         "ticker": req.ticker.strip().upper(),
         "interval": req.interval,
         "strategy": {"slug": strategy.slug, "name": strategy.name},
-        # Echo the fully resolved settings, not just what was sent, so the
-        # response states exactly what was run.
-        "params": registry.params_as_dict(params),
+        # Echo the resolved settings (defaults filled in) so the response shows exactly what ran.
+        "params": asdict(params),
         "config": asdict(config),
         "start": curve[0]["date"],
         "end": curve[-1]["date"],
@@ -186,10 +140,3 @@ def run_backtest(req: BacktestRequest):
         "equity": curve,
         "trades": trades_mod.to_records(result.trades),
     }
-
-    if req.include_bars:
-        bars = signals.copy()
-        bars["position"] = result.position
-        response["bars"] = to_records(df.join(bars))
-
-    return response

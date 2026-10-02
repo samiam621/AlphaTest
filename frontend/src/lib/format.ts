@@ -1,9 +1,8 @@
 /**
- * Display helpers.
+ * Helpers that turn numbers into display text, plus the monthly-returns calculation.
  *
- * The backend returns `null` for any statistic it could not compute rather than
- * NaN, so every formatter here has to have an answer for "no value" — an em
- * dash, so a missing Sharpe reads as missing instead of as zero.
+ * The backend sends null for stats it couldn't compute, so every formatter
+ * shows null as "—" (missing), never as 0.
  */
 
 import type { EquityPoint } from './api'
@@ -23,11 +22,13 @@ export function pctPlain(value: number | null | undefined, decimals = 2): string
   return `${(value * 100).toFixed(decimals)}%`
 }
 
+/** Number with fixed decimals: 1.234 -> "1.23". */
 export function num(value: number | null | undefined, decimals = 2): string {
   if (value == null || !Number.isFinite(value)) return EMPTY
   return value.toFixed(decimals)
 }
 
+/** Dollar amount: 12345.6 -> "$12,345.60". */
 export function money(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return EMPTY
   return `$${value.toLocaleString('en-US', {
@@ -36,12 +37,12 @@ export function money(value: number | null | undefined): string {
   })}`
 }
 
-/** ISO timestamps from the API carry a timezone; the calendar day is enough. */
+/** "2024-03-15T00:00:00-04:00" -> "2024-03-15". */
 export function day(iso: string): string {
   return iso.slice(0, 10)
 }
 
-/** `ma_type` -> `Ma Type`, so a form label comes straight from the field name. */
+/** Field name -> form label: `ma_type` -> `Ma Type`. */
 export function labelFor(name: string): string {
   return name
     .split('_')
@@ -58,21 +59,18 @@ export interface MonthlyReturn {
 }
 
 /**
- * Month-by-month returns of the equity curve.
+ * Month-by-month returns for the Monthly Returns heatmap.
  *
- * Derived here rather than fetched: the backend sends the full curve already,
- * and asking it for a second, differently-bucketed view of the same numbers
- * would be a round trip to compute something the browser is holding.
- *
- * Each month is measured from the last equity value of the previous month, so
- * the months chain back to the total return. The first month measures from the
- * curve's opening value.
+ * Computed in the browser since it already has the full equity curve (no extra API call).
+ * Each month = this month's last value / last month's last value - 1, so the
+ * months multiply back to the total return. The first month starts from the first bar.
  */
 export function monthlyReturns(equity: EquityPoint[]): MonthlyReturn[] {
   const out: MonthlyReturn[] = []
   let previousClose: number | null = null
   let current: { year: number; month: number; close: number } | null = null
 
+  // Finish the current month and record its return.
   const flush = () => {
     if (!current) return
     const base = previousClose
@@ -88,14 +86,13 @@ export function monthlyReturns(equity: EquityPoint[]): MonthlyReturn[] {
 
   for (const point of equity) {
     if (point.equity == null || !Number.isFinite(point.equity)) continue
-    // The date is an ISO string from pandas; slicing beats constructing a Date,
-    // which would shift the bar into the viewer's timezone and can move a
-    // month-end bar into the next month.
+    // Read year/month straight from the date string. new Date() would convert to
+    // the viewer's timezone and could push a month-end bar into the next month.
     const year = Number(point.date.slice(0, 4))
     const month = Number(point.date.slice(5, 7)) - 1
 
     if (!current) {
-      // The opening bar is the base for the first month, not a return itself.
+      // First bar = starting value for month one, not a return itself.
       previousClose = point.equity
       current = { year, month, close: point.equity }
       continue

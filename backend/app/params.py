@@ -1,14 +1,9 @@
-"""Building validated settings objects out of untrusted user input.
+"""Turns raw user input (JSON) into checked settings objects.
 
-Strategy parameters and backtest configuration are the same problem twice: a
-frozen dataclass of defaults, a user who overrides some of them, and a JSON or
-query-string value that may not even be the right type. This module does that
-job once, so ``rsi_threshold`` and ``BacktestConfig`` behave identically when a
-field is misspelled or a number arrives as text.
-
-The dataclass keeps ownership of what its values *mean* — ``__post_init__``
-still raises for a fast window longer than the slow one. This module only gets
-the values to it in the right shape.
+Used for both strategy settings (registry.Strategy) and BacktestConfig (backtest/config.py):
+    describe(cls)       -> list of fields, so the UI can draw a form
+    build(cls, values)  -> a settings object (strings converted to numbers, typos rejected)
+Value checks (e.g. fast < slow) live in each dataclass's own __post_init__.
 """
 
 from __future__ import annotations
@@ -16,20 +11,15 @@ from __future__ import annotations
 from dataclasses import MISSING, fields, is_dataclass
 from typing import Any, Mapping, get_type_hints
 
-# Python type -> the name a frontend uses to pick an input widget.
+# Python type -> name the UI uses to pick an input widget.
 TYPE_NAMES = {int: "int", float: "float", str: "str", bool: "bool"}
 
 
 def describe(cls: type) -> list[dict[str, Any]]:
-    """Field name, type, default and any fixed choices, for rendering a form.
-
-    Read off the dataclass itself so there is no second copy of the schema to
-    drift: change a default in the dataclass and the UI follows.
-    """
+    """List each field's name, type, default and dropdown choices, so the UI can build a form."""
     if not is_dataclass(cls):
         raise TypeError(f"{cls.__name__} must be a dataclass")
-    # These modules use `from __future__ import annotations`, so the raw
-    # annotations are strings; get_type_hints resolves them to real types.
+    # Type hints are stored as strings here; get_type_hints turns them into real types.
     hints = get_type_hints(cls)
 
     described = []
@@ -44,8 +34,7 @@ def describe(cls: type) -> list[dict[str, Any]]:
             "type": TYPE_NAMES.get(hints.get(f.name, str), "str"),
             "default": f.default,
         }
-        # Nothing in the annotation says a field is one of a fixed set, so the
-        # dataclass declares it as field metadata.
+        # Dropdown options, declared via field(metadata={"choices": ...}).
         choices = f.metadata.get("choices")
         if choices is not None:
             spec["choices"] = list(choices)
@@ -54,14 +43,8 @@ def describe(cls: type) -> list[dict[str, Any]]:
 
 
 def coerce(value: Any, expected: type, name: str, label: str) -> Any:
-    """Convert one value to the type its field expects, or say why it can't.
-
-    A JSON body arrives correctly typed, but a query string makes everything a
-    string, so ``period="14"`` has to become ``14`` before the strategy tries
-    arithmetic with it.
-    """
-    # bool subclasses int, so it must be handled first or True would quietly
-    # become the window length 1.
+    """Convert one value to its field's type (e.g. "14" -> 14), or raise ValueError."""
+    # Check bool first: bool is a subclass of int, so True would pass as 1.
     if expected is bool:
         if isinstance(value, bool):
             return value
@@ -69,31 +52,18 @@ def coerce(value: Any, expected: type, name: str, label: str) -> Any:
             return value.lower() == "true"
         raise ValueError(f"{label}.{name} must be true or false, got {value!r}")
 
-    if expected is int:
-        if isinstance(value, bool):
-            raise ValueError(f"{label}.{name} must be a whole number, got {value!r}")
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float) and value.is_integer():
-            return int(value)
+    if expected in (int, float):
         if isinstance(value, str):
             try:
-                return int(value.strip())
+                return expected(value.strip())
             except ValueError:
                 pass
-        raise ValueError(f"{label}.{name} must be a whole number, got {value!r}")
-
-    if expected is float:
-        if isinstance(value, bool):
-            raise ValueError(f"{label}.{name} must be a number, got {value!r}")
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            try:
-                return float(value.strip())
-            except ValueError:
-                pass
-        raise ValueError(f"{label}.{name} must be a number, got {value!r}")
+        # Numbers pass through; an int field also takes 3.0 but not 3.5.
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            if expected is float or isinstance(value, int) or value.is_integer():
+                return expected(value)
+        kind = "a whole number" if expected is int else "a number"
+        raise ValueError(f"{label}.{name} must be {kind}, got {value!r}")
 
     if expected is str:
         if isinstance(value, str):
@@ -104,16 +74,12 @@ def coerce(value: Any, expected: type, name: str, label: str) -> Any:
 
 
 def build(cls: type, values: Mapping[str, Any] | None, label: str):
-    """Construct ``cls`` from partial user input.
-
-    Unknown keys are rejected rather than ignored: a misspelled field would
-    otherwise silently run on the default and look like the setting simply had
-    no effect. Fields left out — or sent as null — keep their defaults.
-    """
+    """Create ``cls`` from user input. Unknown keys raise an error; missing ones keep their defaults."""
     values = dict(values or {})
     hints = get_type_hints(cls)
     known = {f.name for f in fields(cls)}
 
+    # Reject typos, otherwise a misspelled setting would silently do nothing.
     unknown = sorted(set(values) - known)
     if unknown:
         raise ValueError(
@@ -126,5 +92,5 @@ def build(cls: type, values: Mapping[str, Any] | None, label: str):
         for name, value in values.items()
         if value is not None
     }
-    # The dataclass's own __post_init__ does the real validation from here.
+    # The dataclass's __post_init__ runs its own range checks from here.
     return cls(**supplied)

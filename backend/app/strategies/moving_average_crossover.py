@@ -1,11 +1,9 @@
 """Moving average crossover
-Long whenever the fast average is above the slow one. The fast average reacts
-to recent bars sooner, so it sits above the slow one while price is trending up
-and below it while trending down.
+Hold while the fast (short-window) average is above the slow (long-window) one.
+The fast average reacts to new prices sooner, so it's on top during uptrends
+and below during downtrends.
 
-This is a *state* rule: the condition and the position are the same thing, so
-there is nothing to remember between bars. Crossovers are just where the state
-happens to flip.
+State rule: the condition itself is the position; nothing to remember between bars.
 """
 
 from __future__ import annotations
@@ -15,7 +13,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from backend.app.strategies.indicators import ema, sma
-from backend.app.strategies.signal_utils import from_state, require_columns
+from backend.app.strategies.signal_utils import from_state
 
 NAME = "Moving Average Crossover"
 
@@ -24,10 +22,8 @@ NAME = "Moving Average Crossover"
 class MovingAverageCrossoverParams:
     fast: int = 20
     slow: int = 50
-    # "sma" weights every bar in the window equally; "ema" leans on recent bars
-    # and so turns a few bars sooner, at the cost of more whipsaws.
-    # The metadata is what tells the registry to offer a dropdown rather than a
-    # free-text box; __post_init__ below is what actually enforces it.
+    # "sma" weights all bars equally; "ema" favours recent bars (reacts sooner,
+    # but gives more false signals). "choices" makes the UI show a dropdown.
     ma_type: str = field(default="sma", metadata={"choices": ("sma", "ema")})
 
     def __post_init__(self) -> None:
@@ -44,16 +40,14 @@ def generate_signals(
     df: pd.DataFrame,
     params: MovingAverageCrossoverParams | None = None,
 ) -> pd.DataFrame:
-    """Return the two averages plus a 0/1 ``signal`` column, indexed like ``df``."""
+    """Return the two averages plus a 0/1 ``signal`` column."""
     params = params or MovingAverageCrossoverParams()
-    require_columns(df, ("close",))
 
     average = sma if params.ma_type == "sma" else ema
     fast = average(df["close"], params.fast)
     slow = average(df["close"], params.slow)
 
-    # Both averages are NaN until the slow window fills, and NaN comparisons are
-    # False, so the warm-up bars come out flat rather than accidentally long.
+    # While either average is still NaN (warm-up), the comparison is False, so those bars stay 0.
     return pd.DataFrame(
         {"fast": fast, "slow": slow, "signal": from_state(fast > slow)},
         index=df.index,

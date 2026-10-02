@@ -1,16 +1,11 @@
 """RSI threshold — mean reversion on an oscillator extreme.
 
-Buy when RSI drops through the oversold line (the selloff is assumed to have
-overshot) and sell when it climbs through the overbought line. Between 30 and 70
-you simply hold whatever you already had.
+"Mean reversion" = betting that a big move will bounce back toward normal.
+Buy when RSI crosses below ``oversold`` (fell too far), sell when it crosses
+above ``overbought``. In between, keep whatever position we already have.
 
-That in-between zone is why this needs *events* rather than state: at RSI 50 the
-rule says nothing about what your position should be, so it has to be carried
-forward from the last entry or exit.
-
-Note the entry is a *crossing*, not a level. "RSI below 30" is true on every bar
-of a long slide; "RSI just crossed below 30" fires once, at the point the
-condition became true.
+Event rule: the middle zone says nothing, so the position carries forward.
+Uses crossings (fire once), not levels (true on every bar of a long drop).
 """
 
 from __future__ import annotations
@@ -24,7 +19,6 @@ from backend.app.strategies.signal_utils import (
     cross_above,
     cross_below,
     from_events,
-    require_columns,
 )
 
 NAME = "RSI Threshold"
@@ -50,7 +44,6 @@ def generate_signals(
 ) -> pd.DataFrame:
     """Return the ``rsi`` series and a 0/1 ``signal`` column."""
     params = params or RsiThresholdParams()
-    require_columns(df, ("close",))
 
     strength = rsi(df["close"], params.period)
 

@@ -3,16 +3,14 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
 
-// Where the FastAPI backend is listening. Override with BACKEND_URL when it
-// runs somewhere other than the default uvicorn port.
+// Backend address for the dev proxy below (override with BACKEND_URL).
 const BACKEND_URL = process.env.BACKEND_URL || 'http://127.0.0.1:8000'
 
-// Port 5173 is not arbitrary: it is what backend/app/main.py allows in its CORS
-// origins, so a direct fetch works even if the proxy below is bypassed.
+// 5173 matches the CORS origins allowed in backend/app/main.py.
 const PORT = parseInt(process.env.PORT || '5173')
 
-// Proxying /api keeps the browser on one origin, so there is no preflight and
-// no backend host baked into the production bundle.
+// Forward /api requests to the backend, so the browser only talks to one
+// server (no CORS issues, no backend URL hardcoded in the build).
 const proxy = {
   '/api': { target: BACKEND_URL, changeOrigin: true },
 }
